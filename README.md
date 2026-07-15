@@ -71,6 +71,54 @@ your workspace. This gives you the two Slack tokens below.
 **Step 3 — run it**: `npm start`, then `node slack-autofix-bot.mjs scan` to
 thread buttons under the latest failing reports in your channel.
 
+### Prerequisite — your CI must post test reports into the channel
+
+The bot doesn't run tests on a schedule itself; it **reacts to CI report
+messages** already landing in your Slack channel. If your channel is empty, set
+this up first — it's what makes the whole flow work:
+
+**1. A scheduled CI job runs your suite** (Jenkins pipeline, GitHub Actions
+cron, GitLab schedule — anything), e.g. nightly or per release-candidate.
+
+**2. After the run, the job posts a summary to the channel** (Slack incoming
+webhook or a reporter plugin). The bot detects a report message when it has:
+
+| Required | Example |
+|---|---|
+| The words `Sanity Report` or `Monitoring Report` (or the posting app is named `Cypress Test Reporter`) | `Sanity Report \| desktopWeb \| Hotels \| v2.205.3-RC.0` |
+| A failed count in the form `Failed: N` | `✖️ Failed: 15` |
+| *(Recommended)* a **Report link** to your quality dashboard: `…/public/insights/<category>/<24-hex-id>` | `<https://quality.example.com/public/insights/cypress/6a51…c0b6\|Report>` |
+
+With the Report link, the modal shows real per-spec failures + AI root causes
+(the bot fetches the report JSON — mochawesome-style `results[].tests[]` with
+`state` and `err.message`). Without it, the bot falls back to a plain spec
+picker from the GitHub tree — it works, but you lose the error-driven triage.
+
+Example CI step (after the test run, using an incoming webhook):
+
+```bash
+# counts from mochawesome merged JSON (adapt to your reporter)
+TOTAL=$(jq .stats.tests report.json); PASS=$(jq .stats.passes report.json)
+FAIL=$(jq .stats.failures report.json); SKIP=$(jq .stats.pending report.json)
+curl -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' -d @- <<EOF
+{"text":"🚀 Sanity Report | desktopWeb | Hotels | $BUILD_TAG | <https://quality.example.com/public/insights/cypress/$REPORT_ID|Report>\n\n\`\`\`🧪 Total: $TOTAL   ✔️ Passed: $PASS   ✖️ Failed: $FAIL   ⏳ Pending/Skipped: $SKIP\`\`\`"}
+EOF
+```
+
+**3. (Optional) crashed-build alerts** — the bot also reacts to Jenkins crash
+messages containing the words `Jenkins Crash` plus a build URL
+(`https://<jenkins>/job/…/job/<name>/<build>/`). An `Action:` line with a
+question gets answered directly in the AI's RCA reply:
+
+```
+Jenkins Crash: Nightly/Hotels/destination-types #276 - EXECUTION_TIMEOUT
+Job: <https://jenkins.example.com/job/Nightly/job/Hotels/job/destination-types/276/>
+Action: 👥 Hotel Team: @lead - DO WE NEED TO SPLIT THE JOB?
+```
+
+Once these messages flow, `scan` (or the auto-watcher, if the bot is invited)
+threads the analyse buttons under them — and everything else follows.
+
 ### Cypress AND Playwright
 
 Set `AUTOFIX_FRAMEWORK=cypress` or `playwright` (globally, or per channel in

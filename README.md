@@ -41,7 +41,7 @@ actionable, AI-analyzed threads:
 > 4. **CI/CD that posts test reports into the Slack channel** (scheduled
 >    Jenkins/GitHub Actions/GitLab runs) — see the prerequisite section below
 >    for the exact message format.
-> 5. The **[AutoHeal portal](https://github.com/renukadevig/Agent-AutoHeal-TestScripts)**
+> 5. The **[AutoHeal portal](https://github.com/renukadevig/CI-FailedTestScripts-AutoFix-Portal)**
 >    running somewhere reachable — the bot delegates the actual fixing to it.
 >    (Analysis-only use works without it.)
 > 6. **macOS** for the runtime Chrome-session reader; on Linux/Windows set
@@ -55,7 +55,7 @@ actionable, AI-analyzed threads:
 
 | Dependency | How |
 |---|---|
-| **QA portal** (the fix engine) | plain HTTP — `POST $PORTAL_URL/api/heal`; run the [portal](https://github.com/renukadevig/Agent-AutoHeal-TestScripts) separately |
+| **QA portal** (the fix engine) | plain HTTP — `POST $PORTAL_URL/api/heal`; run the [portal](https://github.com/renukadevig/CI-FailedTestScripts-AutoFix-Portal) separately |
 | **Quality dashboard** (report data) | operator's own Chrome session, read at runtime (macOS Keychain) — no pasted cookies |
 | **Jenkins** (console logs) | same runtime Chrome-session mechanism |
 | **AI analysis** | local `claude` CLI (subscription login, no API key); model via `AUTOFIX_ANALYSIS_MODEL` (default `claude-fable-5`) |
@@ -86,7 +86,7 @@ your workspace. This gives you the two Slack tokens below.
 | `AUTOFIX_FRAMEWORK` | `cypress` or `playwright` | **your test framework** — drives fix prompts + the verification runner |
 | `AUTOFIX_SPEC_FILTER` *(optional)* | `hotel` | narrows the fallback spec picker to your product's paths |
 | `AUTOFIX_ANALYSIS_MODEL` *(optional)* | `claude-fable-5` | model for the triage analysis |
-| `PORTAL_URL` | `http://127.0.0.1:8080` | where the [AutoHeal portal](https://github.com/renukadevig/Agent-AutoHeal-TestScripts) runs |
+| `PORTAL_URL` | `http://127.0.0.1:8080` | where the [AutoHeal portal](https://github.com/renukadevig/CI-FailedTestScripts-AutoFix-Portal) runs |
 | `GITHUB_TOKEN` | `ghp_…` | read the specs repo tree (fallback picker) |
 | `CLAUDE_CLI_PATH` | `/usr/local/bin/claude` | your locally installed + logged-in Claude Code CLI |
 | `QUALITY_URL` | `https://your-quality-dashboard` | report source; leave `QUALITY_COOKIE` blank to read your Chrome session live (macOS) |

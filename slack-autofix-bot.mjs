@@ -519,6 +519,7 @@ function crashRcaText(jobLabel, buildNo, a, buildUrl) {
 /** Post the RCA into the thread once per build (dedupe via the cache entry). */
 async function shareCrashRca({ client, channel, threadTs, buildUrl, jobLabel, buildNo, a }) {
     if (a.sharedTs) return;
+    a.sharedTs = 'posting'; // claim synchronously — concurrent clickers bail out here
     const res = await client.chat.postMessage({
         channel,
         thread_ts: threadTs,
@@ -543,6 +544,32 @@ app.action('crash_analyse', async ({ ack, body, client, action }) => {
     }
     const jobLabel = (buildUrl.match(/\/job\/(.+?)\/\d+\/$/) || [])[1]?.replace(/\/job\//g, '/') || 'build';
     const buildNo = (buildUrl.match(/\/(\d+)\/$/) || [])[1] || '?';
+
+    // Cold cache → swap the thread button for a loading notice (no double runs).
+    const crashKey = `crash:${buildUrl}`;
+    const crashReady = analysisCache.has(crashKey) || loadAnalysisCache().has(crashKey);
+    const crashIntro = body.message.blocks?.[0]?.text?.text || '';
+    const setCrashMsg = (blocks, fallback) =>
+        client.chat
+            .update({ channel: body.channel.id, ts: body.message.ts, text: fallback, blocks })
+            .catch(() => {});
+    if (!crashReady) {
+        await setCrashMsg(
+            [
+                { type: 'section', text: { type: 'mrkdwn', text: crashIntro } },
+                {
+                    type: 'context',
+                    elements: [
+                        {
+                            type: 'mrkdwn',
+                            text: `⏳ *AI crash analysis in progress…* started by <@${body.user.id}>. The button returns when the RCA is posted (~30-60s).`,
+                        },
+                    ],
+                },
+            ],
+            'AI crash analysis in progress…',
+        );
+    }
 
     const loading = await client.views.open({
         trigger_id: body.trigger_id,
@@ -610,6 +637,27 @@ app.action('crash_analyse', async ({ ack, body, client, action }) => {
                 },
             },
         ];
+    }
+
+    if (!crashReady) {
+        await setCrashMsg(
+            [
+                { type: 'section', text: { type: 'mrkdwn', text: crashIntro } },
+                {
+                    type: 'actions',
+                    elements: [
+                        {
+                            type: 'button',
+                            style: 'primary',
+                            text: { type: 'plain_text', text: '🧠 AI Analyse Crash' },
+                            action_id: 'crash_analyse',
+                            value: action.value,
+                        },
+                    ],
+                },
+            ],
+            'AI crash analysis ready',
+        );
     }
 
     await client.views.update({

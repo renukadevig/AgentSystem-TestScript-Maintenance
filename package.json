@@ -1,0 +1,14 @@
+{
+    "name": "qa-slack-autofix-bot",
+    "version": "1.0.0",
+    "description": "Slack bot: AI failure analysis + one-click auto-fix for Cypress CI reports, and console-log RCA for crashed Jenkins builds",
+    "type": "module",
+    "main": "slack-autofix-bot.mjs",
+    "scripts": {
+        "start": "node slack-autofix-bot.mjs",
+        "scan": "node slack-autofix-bot.mjs scan"
+    },
+    "dependencies": {
+        "@slack/bolt": "^4.6.0"
+    }
+}

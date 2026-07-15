@@ -27,6 +27,30 @@ actionable, AI-analyzed threads:
  → draft PR link in thread
 ```
 
+## Requirements — who can use this
+
+> **Disclaimer:** this bot is useful only if your team already has ALL of the
+> following. Without any one of them, the flow cannot work end-to-end:
+>
+> 1. **A Slack workspace** where you can create an app (or get one approved).
+> 2. **GitHub** hosting your test-specs repo, plus a token with write access
+>    to it (draft PRs are opened there).
+> 3. **A Claude Code subscription** — the `claude` CLI must be installed and
+>    logged in on the machine running the bot/portal; it powers the failure
+>    analysis, crash RCA, and the fixes themselves. No API key is used.
+> 4. **CI/CD that posts test reports into the Slack channel** (scheduled
+>    Jenkins/GitHub Actions/GitLab runs) — see the prerequisite section below
+>    for the exact message format.
+> 5. The **[AutoHeal portal](https://github.com/renukadevig/Agent-AutoHeal-TestScripts)**
+>    running somewhere reachable — the bot delegates the actual fixing to it.
+>    (Analysis-only use works without it.)
+> 6. **macOS** for the runtime Chrome-session reader; on Linux/Windows set
+>    `QUALITY_COOKIE` manually.
+>
+> Maturity: a working internal tool, proven end-to-end on real CI failures —
+> but shipped as-is, without warranty; review the safety model and test on a
+> scratch channel/repo before adopting.
+
 ## How it connects
 
 | Dependency | How |
@@ -67,6 +91,8 @@ your workspace. This gives you the two Slack tokens below.
 | `CLAUDE_CLI_PATH` | `/usr/local/bin/claude` | your locally installed + logged-in Claude Code CLI |
 | `QUALITY_URL` | `https://your-quality-dashboard` | report source; leave `QUALITY_COOKIE` blank to read your Chrome session live (macOS) |
 | `AUTOFIX_CHANNEL_CONFIG` *(optional)* | see below | per-channel repo/branch/framework map |
+| `SCAN_INTERVAL_MINUTES` *(optional)* | `5` | auto-scan: sweep the channel(s) every N minutes and thread buttons under new failing/crashed messages — no channel invite needed (`0` = off) |
+| `REPORT_LINK_HINT` *(optional)* | `report` | substring to pick the report link when a CI message contains several URLs |
 
 **Step 3 — run it**: `npm start`, then `node slack-autofix-bot.mjs scan` to
 thread buttons under the latest failing reports in your channel.
@@ -170,7 +196,7 @@ Everything a team changes lives in `.env` — no code edits:
 
 ```bash
 node slack-autofix-bot.mjs                  # run the bot (long-lived)
-node slack-autofix-bot.mjs scan [N]         # thread buttons under the last N failing/crashed messages
+node slack-autofix-bot.mjs scan [N] [#chan] # thread buttons under the last N failing/crashed messages (channel optional)
 node slack-autofix-bot.mjs warm <reportId>… # pre-run AI triage for report id(s) — makes modals instant
 node slack-autofix-bot.mjs crash-rca <ts>   # analyze a crash message by ts and post the RCA in-thread
 node slack-autofix-bot.mjs post <spec> [name]  # manual one-off failed-test card
@@ -181,9 +207,11 @@ node slack-autofix-bot.mjs post <spec> [name]  # manual one-off failed-test card
 - **Analysis cache** (`.analysis-cache.json`, gitignored): one AI pass per
   report/build, shared between the bot and the `scan`/`warm` CLI processes;
   `scan` pre-warms so modals open instantly.
-- **Loading states**: uncached clicks show an in-modal "Analyzing…" view and
-  swap the thread button for an *"AI analysis in progress…"* notice (also
-  prevents duplicate concurrent runs); every exit path restores the button.
+- **Loading states** (both buttons — failures and crash): uncached clicks show
+  an in-modal "Analyzing…" view and swap the thread button for an
+  *"AI analysis in progress…"* notice, so nobody can start a duplicate run;
+  the button is restored on every exit path, and racing clicks share a single
+  analysis (the crash RCA can never double-post).
 - **Report picker** shows only the specs that actually failed (spec file names,
   root cause as the subtitle; full paths in the triage list).
 - **Crash RCAs post once per build** — repeat clicks reuse the cached analysis.

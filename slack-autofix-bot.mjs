@@ -27,6 +27,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import bolt from '@slack/bolt';
 import { getQualityCookieHeader } from './quality-cookie.mjs';
@@ -157,58 +158,75 @@ function confirmDialog(specLabel, repo) {
 }
 
 // ---- report-driven failures (quality.almosafer.io) -----------------------------
-// reportId → [{ spec, errors: [{ title, message }] }]
+// key → { failed: [{ spec, errors: [{ title, message }] }], stats }
 const reportCache = new Map();
 
-/** Pull the 24-char report id out of a reporter message's Report link.
- *  The category segment (cypress/backend/…) is captured so the right
- *  dashboard API is queried — remembered per report id. */
+// ---- report references: works with ANY report link, not just the dashboard ----
+// Insights links keep their 24-hex id as the key; any other report URL gets a
+// short hash key. Refs are persisted (analysisCache file) so buttons survive
+// bot restarts.
 const reportCategory = new Map();
-function extractReportId(msg) {
-    const m = JSON.stringify(msg).match(/public\/insights\/(\w[\w-]*)\/([a-f0-9]{24})/i);
-    if (!m) return null;
-    reportCategory.set(m[2], m[1]);
-    return m[2];
+const REPORT_LINK_HINT = (process.env.REPORT_LINK_HINT || '').toLowerCase();
+
+function refKeyForUrl(url) {
+    return crypto.createHash('sha1').update(url).digest('hex').slice(0, 12);
+}
+function rememberRef(key, ref) {
+    analysisCache.set(`ref:${key}`, ref);
+    persistAnalysisCache();
+}
+function lookupRef(key) {
+    if (analysisCache.has(`ref:${key}`)) return analysisCache.get(`ref:${key}`);
+    const disk = loadAnalysisCache();
+    return disk.get(`ref:${key}`) || null;
 }
 
 /**
- * Fetch the Cypress report from the quality dashboard and return failed tests
- * grouped by spec file. Shape from cypress-report-adapter.ts: results[] (and
- * buildResults[].results[]) → suites with file/_flattenMetadata.filePath and
- * tests[] carrying state + err.message.
+ * Find the report link in a CI message and return a short cache key for it.
+ * Priority: quality-dashboard insights link (native JSON API) → any other
+ * http(s) link (fetched and parsed generically, AI fallback for HTML/unknown).
+ * REPORT_LINK_HINT (env) picks the right link when a message carries several.
  */
+function extractReportId(msg) {
+    const raw = JSON.stringify(msg);
+    const m = raw.match(/public\/insights\/(\w[\w-]*)\/([a-f0-9]{24})/i);
+    if (m) {
+        reportCategory.set(m[2], m[1]);
+        rememberRef(m[2], { kind: 'insights', category: m[1] });
+        return m[2];
+    }
+    // generic report link: any URL except Slack itself and Jenkins build links
+    const urls = (raw.match(/https?:\/\/[^\s"'<>\\|]+/gi) || [])
+        .map((u) => u.replace(/[\\").,]+$/, ''))
+        .filter((u) => !/slack\.com|slack-edge\.com/i.test(u))
+        .filter((u) => !JENKINS_BUILD_RE.test(u))
+        .filter((u) => !/\.(png|jpe?g|gif|svg)(\?|$)/i.test(u));
+    if (!urls.length) return null;
+    const pick = REPORT_LINK_HINT ? urls.find((u) => u.toLowerCase().includes(REPORT_LINK_HINT)) || urls[0] : urls[0];
+    const key = refKeyForUrl(pick);
+    rememberRef(key, { kind: 'generic', url: pick });
+    return key;
+}
+
 // Cookie source: explicit env override, else read live from the user's own
-// Chrome session (scripts/quality-cookie.mjs) — cached briefly so a burst of
-// picks doesn't hammer the Keychain/cookie store.
+// Chrome session (scripts/quality-cookie.mjs) — cached briefly.
 let liveCookie = { at: 0, value: '' };
 async function qualityCookie() {
     if (QUALITY_COOKIE) return QUALITY_COOKIE;
     if (Date.now() - liveCookie.at < 5 * 60 * 1000 && liveCookie.value) return liveCookie.value;
     const value = await getQualityCookieHeader(QUALITY_URL);
-    if (!value) throw new Error('no quality.almosafer.io session in Chrome — log in there first');
+    if (!value) throw new Error(`no ${QUALITY_URL || 'quality dashboard'} session in Chrome — log in there first`);
     liveCookie = { at: Date.now(), value };
     return value;
 }
 
-async function fetchFailedSpecs(reportId) {
-    if (!QUALITY_URL) throw new Error('QUALITY_URL not set — configure the quality dashboard base URL in .env');
-    if (reportCache.has(reportId)) return reportCache.get(reportId);
-    const cookie = await qualityCookie();
-    const res = await fetch(`${QUALITY_URL}/api/insights/${reportCategory.get(reportId) || 'cypress'}/${reportId}`, {
-        headers: { cookie, 'user-agent': 'qa-autofix-bot' },
-        redirect: 'manual', // a login redirect means the session expired
-    });
-    if (res.status >= 300 && res.status < 400) {
-        liveCookie = { at: 0, value: '' }; // force a fresh Chrome read next time
-        throw new Error('quality session expired — log in to quality.almosafer.io in Chrome');
-    }
-    if (!res.ok) throw new Error(`quality API ${res.status}`);
-    const data = await res.json();
+// ---- format parsers → the shared { failed:[{spec,errors:[{title,message}]}], stats } shape ----
+
+/** Our quality dashboard's shape: results[]/buildResults[].results[] suites. */
+function parseDashboardReport(data) {
     const report = data?.report || data?.rawReport || data?.data?.report || data?.data || data;
-    const suites = [
-        ...(report?.results || []),
-        ...(report?.buildResults || []).flatMap((b) => b?.results || []),
-    ];
+    const suites = [...(report?.results || []), ...(report?.buildResults || []).flatMap((b) => b?.results || [])];
+    if (!suites.length) return null;
     const bySpec = new Map();
     for (const suite of suites) {
         const spec = suite?._flattenMetadata?.filePath || suite?.file || '';
@@ -216,24 +234,139 @@ async function fetchFailedSpecs(reportId) {
         for (const t of suite?.tests || []) {
             if ((t.state || '').toLowerCase() !== 'failed') continue;
             if (!bySpec.has(spec)) bySpec.set(spec, []);
-            bySpec.get(spec).push({
-                title: t.fullTitle || t.title || '(untitled test)',
-                message: t.err?.message || '(no error message captured)',
-            });
+            bySpec.get(spec).push({ title: t.fullTitle || t.title || '(untitled test)', message: t.err?.message || '(no error message captured)' });
         }
     }
-    const failed = [...bySpec.entries()].map(([spec, errors]) => ({ spec, errors }));
-    // Full-run stats travel with the failures so the thread can show the
-    // complete picture (all / passed / failed / skipped), not just failures.
-    const s = report?.stats || {};
-    const stats = {
-        total: s.tests ?? null,
-        passed: s.passes ?? null,
-        failed: s.failures ?? null,
-        skipped: (s.skipped ?? 0) + (s.pending ?? 0) || null,
+    const st = report?.stats || {};
+    return {
+        failed: [...bySpec.entries()].map(([spec, errors]) => ({ spec, errors })),
+        stats: { total: st.tests ?? null, passed: st.passes ?? null, failed: st.failures ?? null, skipped: (st.skipped ?? 0) + (st.pending ?? 0) || null },
     };
-    const entry = { failed, stats };
-    reportCache.set(reportId, entry);
+}
+
+/** mochawesome merged JSON: results[] with nested suites[]/tests[]. */
+function parseMochawesome(data) {
+    if (!data?.stats || !Array.isArray(data?.results)) return null;
+    const bySpec = new Map();
+    const walk = (node, file) => {
+        const f = node.fullFile || node.file || file || '';
+        for (const t of node.tests || []) {
+            if ((t.state || '').toLowerCase() !== 'failed') continue;
+            const spec = f || 'unknown';
+            if (!bySpec.has(spec)) bySpec.set(spec, []);
+            bySpec.get(spec).push({ title: t.fullTitle || t.title || '(untitled)', message: t.err?.message || t.err?.estack || '(no error captured)' });
+        }
+        for (const su of node.suites || []) walk(su, f);
+    };
+    for (const r of data.results) walk(r, r.fullFile || r.file);
+    const st = data.stats;
+    return {
+        failed: [...bySpec.entries()].map(([spec, errors]) => ({ spec: spec.replace(/^.*?(cypress|tests?|e2e)\//, '$1/'), errors })),
+        stats: { total: st.tests ?? null, passed: st.passes ?? null, failed: st.failures ?? null, skipped: (st.pending ?? 0) + (st.skipped ?? 0) || null },
+    };
+}
+
+/** Playwright JSON reporter: suites[].specs[].tests[].results[].status. */
+function parsePlaywrightJson(data) {
+    if (!Array.isArray(data?.suites)) return null;
+    const bySpec = new Map();
+    let total = 0, passed = 0, failedN = 0, skipped = 0;
+    const walk = (suite) => {
+        for (const sp of suite.specs || []) {
+            for (const t of sp.tests || []) {
+                total += 1;
+                const results = t.results || [];
+                const status = results[results.length - 1]?.status || '';
+                if (status === 'passed') passed += 1;
+                else if (status === 'skipped') skipped += 1;
+                else if (status) {
+                    failedN += 1;
+                    const spec = sp.file || suite.file || 'unknown';
+                    if (!bySpec.has(spec)) bySpec.set(spec, []);
+                    bySpec.get(spec).push({ title: sp.title || t.title || '(untitled)', message: results[results.length - 1]?.error?.message || `status: ${status}` });
+                }
+            }
+        }
+        for (const su of suite.suites || []) walk(su);
+    };
+    for (const su of data.suites) walk(su);
+    if (!total) return null;
+    return { failed: [...bySpec.entries()].map(([spec, errors]) => ({ spec, errors })), stats: { total, passed, failed: failedN, skipped: skipped || null } };
+}
+
+/** Universal fallback: let the AI read ANY report (HTML page, custom JSON,
+ *  plain text) and extract the failed tests as structured data. */
+async function aiExtractFailures(content) {
+    const text = content
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&\w+;/g, ' ')
+        .replace(/\s{3,}/g, '\n')
+        .slice(0, 30000);
+    const prompt = `You are reading a QA test-run report (format unknown — could be extracted HTML, JSON or text). Identify the FAILED tests.
+
+Return ONLY JSON:
+{"stats": {"total": <n|null>, "passed": <n|null>, "failed": <n|null>, "skipped": <n|null>},
+ "failures": [{"spec": "<spec/test file path, '' if not shown>", "title": "<test name>", "error": "<error message, max 300 chars>"}]}
+
+REPORT CONTENT:
+${text}`;
+    const out = await runClaudeQuick(prompt);
+    const m = out.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error('AI could not extract failures from the report');
+    const parsed = JSON.parse(m[0]);
+    const bySpec = new Map();
+    for (const f of parsed.failures || []) {
+        const spec = f.spec || '';
+        if (!bySpec.has(spec)) bySpec.set(spec, []);
+        bySpec.get(spec).push({ title: f.title || '(untitled)', message: f.error || '' });
+    }
+    return {
+        failed: [...bySpec.entries()].map(([spec, errors]) => ({ spec, errors })),
+        stats: parsed.stats || { total: null, passed: null, failed: (parsed.failures || []).length, skipped: null },
+    };
+}
+
+/**
+ * Universal failure fetcher. Insights ids use the dashboard JSON API; any
+ * other report URL is fetched (operator Chrome session first, anonymous
+ * fallback) and parsed: known JSON shapes natively, everything else via AI.
+ */
+async function fetchFailedSpecs(key) {
+    if (reportCache.has(key)) return reportCache.get(key);
+    const ref = lookupRef(key) || (/^[a-f0-9]{24}$/i.test(key) ? { kind: 'insights', category: reportCategory.get(key) || 'cypress' } : null);
+    if (!ref) throw new Error('unknown report reference — re-run scan on this message');
+
+    let entry;
+    if (ref.kind === 'insights') {
+        if (!QUALITY_URL) throw new Error('QUALITY_URL not set — configure the quality dashboard base URL in .env');
+        const cookie = await qualityCookie();
+        const res = await fetch(`${QUALITY_URL}/api/insights/${ref.category || 'cypress'}/${key}`, {
+            headers: { cookie, 'user-agent': 'qa-autofix-bot' },
+            redirect: 'manual',
+        });
+        if (res.status >= 300 && res.status < 400) {
+            liveCookie = { at: 0, value: '' };
+            throw new Error(`quality session expired — log in to ${QUALITY_URL} in Chrome`);
+        }
+        if (!res.ok) throw new Error(`quality API ${res.status}`);
+        entry = parseDashboardReport(await res.json());
+        if (!entry) throw new Error('dashboard report had no suites');
+    } else {
+        // generic URL: try the operator's Chrome session, fall back to anonymous
+        let cookie = '';
+        try { cookie = await cookieFor(ref.url); } catch { /* public report */ }
+        const res = await fetch(ref.url, { headers: { ...(cookie ? { cookie } : {}), 'user-agent': 'qa-autofix-bot' } });
+        if (!res.ok) throw new Error(`report fetch ${res.status} from ${new URL(ref.url).hostname}`);
+        const bodyText = await res.text();
+        let json = null;
+        try { json = JSON.parse(bodyText); } catch { /* not JSON */ }
+        entry = (json && (parseDashboardReport(json) || parseMochawesome(json) || parsePlaywrightJson(json))) || null;
+        if (!entry || !entry.failed.length) entry = await aiExtractFailures(bodyText);
+    }
+
+    reportCache.set(key, entry);
     if (reportCache.size > 50) reportCache.delete(reportCache.keys().next().value);
     return entry;
 }
@@ -325,7 +458,7 @@ async function analyzeReport(reportId, failed) {
             })
             .join('\n\n');
 
-        const prompt = `You are a senior QA automation engineer triaging Cypress E2E failures from a CI run against the Almosafer travel site (hotels/flights funnels).
+        const prompt = `You are a senior QA automation engineer triaging end-to-end test failures from a CI run.
 
 For EACH failed spec below, infer the most likely root cause from its error message(s) and classify it.
 
@@ -778,7 +911,7 @@ function analyseButtonBlock(reportId) {
 // ---- Auto-fix button → modal with spec choice -----------------------------------
 app.action('autofix_open_modal', async ({ ack, body, client, action }) => {
     await ack();
-    const rm = /^r:([a-f0-9]{24})$/i.exec(action.value || '');
+    const rm = /^r:([a-f0-9]{12,40})$/i.exec(action.value || '');
     if (!rm) return;
     const threadTs = body.message.thread_ts || body.message.ts;
 
@@ -963,7 +1096,7 @@ app.view('autofix_modal', async ({ ack, body, view, client }) => {
         /* ignore */
     }
     const value = view.state.values?.spec_block?.spec_select?.selected_option?.value || '';
-    const rm = /^r:([a-f0-9]{24}):(\d+)$/i.exec(value);
+    const rm = /^r:([a-f0-9]{12,40}):(\d+)$/i.exec(value);
     if (!rm || !meta.channel) return;
     let spec = value;
     let failureContext = '';
@@ -1141,7 +1274,7 @@ app.action('autofix_pick', async ({ ack, body, client, action }) => {
     let failureContext = '';
     // Report-driven picks carry "r:<reportId>:<idx>" — resolve the spec and its
     // captured errors from the report (cache first, refetch if bot restarted).
-    const rm = /^r:([a-f0-9]{24}):(\d+)$/i.exec(value);
+    const rm = /^r:([a-f0-9]{12,40}):(\d+)$/i.exec(value);
     if (rm) {
         try {
             const { failed } = await fetchFailedSpecs(rm[1]);
@@ -1332,7 +1465,7 @@ if (cmd === 'crash-rca') {
     });
 } else if (cmd === 'warm') {
     // Pre-run the AI triage for a report id (or ids) into the shared cache.
-    const ids = [specArg, ...nameParts].filter((s) => /^[a-f0-9]{24}$/i.test(s || ''));
+    const ids = [specArg, ...nameParts].filter((s) => /^[a-f0-9]{12,40}$/i.test(s || ''));
     if (!ids.length) {
         console.error('Usage: node scripts/slack-autofix-bot.mjs warm <reportId> [reportId…]');
         process.exit(1);

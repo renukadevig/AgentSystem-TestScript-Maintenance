@@ -119,6 +119,26 @@ Action: 👥 Hotel Team: @lead - DO WE NEED TO SPLIT THE JOB?
 Once these messages flow, `scan` (or the auto-watcher, if the bot is invited)
 threads the analyse buttons under them — and everything else follows.
 
+### Any reporting tool (not just the quality dashboard)
+
+The Report link in the CI message can point at **any report**, and the bot
+parses it in tiers:
+
+1. **Quality-dashboard links** (`…/public/insights/<category>/<id>`) — native
+   JSON API, fastest.
+2. **Known JSON formats** — mochawesome merged JSON and Playwright's
+   `--reporter=json` output are parsed natively.
+3. **Anything else — HTML reports, custom JSON, plain text** — the AI reads the
+   fetched content and extracts the failed tests (spec, test name, error).
+   Slower on first click (cached afterwards), but it means Allure/mochawesome
+   HTML/home-grown reports all work without code changes.
+
+Access uses the operator's Chrome session first and falls back to anonymous
+fetch for public report URLs. If a message contains several links, set
+`REPORT_LINK_HINT` (a substring, e.g. `report`) to pick the right one. Note:
+auto-fix needs spec *file paths* — if a report format doesn't include them,
+you still get the failure analysis, just not the one-click fix.
+
 ### Cypress AND Playwright
 
 Set `AUTOFIX_FRAMEWORK=cypress` or `playwright` (globally, or per channel in

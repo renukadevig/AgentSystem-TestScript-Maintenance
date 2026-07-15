@@ -1,5 +1,17 @@
 # QA Slack Auto-fix Bot
 
+**Stop losing hours to broken test scripts.** When a new build hits staging, it
+often breaks E2E scripts without breaking the product — renamed locators,
+changed API contracts, reordered navigation, flaky waits. The scheduled CI run
+then floods your Slack channel with failures, and someone has to triage and fix
+each one by hand.
+
+This bot puts the whole maintenance loop **one click away, right in the Slack
+thread**: AI analyses the failures from the CI report, tells you which are
+test-code issues vs real product bugs, fixes the script, verifies with a real
+rerun, and opens a draft PR — turning hours of test maintenance into minutes of
+review.
+
 A Socket-Mode Slack bot for QA channels that turns CI failure noise into
 actionable, AI-analyzed threads:
 

@@ -1,5 +1,5 @@
 /**
- * Slack Auto-fix bot for #hotel-cypress-logs.
+ * Slack Auto-fix bot for QA CI-report channels.
  *
  * Two ways to trigger a self-heal:
  *   1. AUTO: the bot watches the channel; when the existing "Cypress Test
@@ -15,14 +15,14 @@
  *
  * Runs in Socket Mode — no public URL; works from a laptop behind VPN.
  *
- * Env (in .env.local):
+ * Env (in .env — see .env.example; AUTOFIX_CHANNEL_CONFIG for per-channel repos):
  *   SLACK_BOT_TOKEN=xoxb-…       (Bot User OAuth Token)
  *   SLACK_APP_TOKEN=xapp-…       (App-level token, connections:write)
- *   SLACK_AUTOFIX_CHANNEL=#hotel-cypress-logs
+ *   SLACK_AUTOFIX_CHANNEL=#your-ci-channel
  *   PORTAL_URL=http://127.0.0.1:8080
- *   AUTOFIX_REPO=tajawal/qa-frontend-cypress
+ *   AUTOFIX_REPO=<owner>/<specs-repo>       (where draft PRs are opened)
  *   AUTOFIX_BRANCH=master
- *   AUTOFIX_SPEC_FILTER=hotel    (substring(s) for the spec picker, comma-sep)
+ *   AUTOFIX_SPEC_FILTER=                    (substring(s) for the spec picker, comma-sep)
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -46,18 +46,52 @@ const APP_TOKEN = process.env.SLACK_APP_TOKEN || '';
 // Optional user token (xoxp-…): lets `scan` read channel history AS the user
 // (already a member) so the bot never needs to be invited to the channel.
 const USER_TOKEN = process.env.SLACK_USER_TOKEN || '';
-const CHANNEL = process.env.SLACK_AUTOFIX_CHANNEL || '#hotel-cypress-logs';
+// ---- team-configurable targets (no hardcoded org defaults) --------------------
+// Global defaults come from .env; AUTOFIX_CHANNEL_CONFIG optionally maps each
+// Slack channel to its own specs repo / branch / spec filter, e.g.:
+//   AUTOFIX_CHANNEL_CONFIG={"#hotel-cypress-logs":{"repo":"org/hotel-specs","branch":"master","filter":"hotel"},
+//                           "#flights-cypress-logs":{"repo":"org/flight-specs","filter":"flight"}}
+const CHANNEL = process.env.SLACK_AUTOFIX_CHANNEL || '';
 const PORTAL = (process.env.PORTAL_URL || 'http://127.0.0.1:8080').replace(/\/+$/, '');
-const REPO = process.env.AUTOFIX_REPO || 'tajawal/qa-frontend-cypress';
-const BRANCH = process.env.AUTOFIX_BRANCH || 'master';
+const REPO = process.env.AUTOFIX_REPO || '';
+const BRANCH = process.env.AUTOFIX_BRANCH || '';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
-const SPEC_FILTERS = (process.env.AUTOFIX_SPEC_FILTER || 'hotel')
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
+const SPEC_FILTER_RAW = process.env.AUTOFIX_SPEC_FILTER || '';
+
+let CHANNEL_CONFIG = {};
+try {
+    const parsed = JSON.parse(process.env.AUTOFIX_CHANNEL_CONFIG || '{}');
+    for (const [k, v] of Object.entries(parsed)) CHANNEL_CONFIG[k.toLowerCase().replace(/^#?/, '#')] = v;
+} catch (e) {
+    console.error(`AUTOFIX_CHANNEL_CONFIG is not valid JSON — ignoring it (${e.message})`);
+}
+
+/** Effective config for a channel name; channel map wins over global env. */
+function cfgForName(channelName) {
+    const c = CHANNEL_CONFIG[(channelName || '').toLowerCase().replace(/^#?/, '#')] || {};
+    return {
+        repo: c.repo || REPO,
+        branch: c.branch ?? BRANCH,
+        filter: c.filter ?? SPEC_FILTER_RAW,
+    };
+}
+
+// channel-id → "#name" cache (interactive payloads carry ids, config uses names)
+const chanNames = new Map();
+async function cfgForChannelId(id) {
+    if (!chanNames.has(id)) {
+        try {
+            const r = await readClient.conversations.info({ channel: id });
+            chanNames.set(id, `#${r.channel?.name || ''}`);
+        } catch {
+            chanNames.set(id, '');
+        }
+    }
+    return cfgForName(chanNames.get(id));
+}
 // Quality dashboard (report source). QUALITY_COOKIE is a logged-in session's
 // Cookie header — the "public" report pages still require an Okta session.
-const QUALITY_URL = (process.env.QUALITY_URL || 'https://quality.almosafer.io').replace(/\/+$/, '');
+const QUALITY_URL = (process.env.QUALITY_URL || '').replace(/\/+$/, ''); // quality dashboard base — required for report-driven triage
 const QUALITY_COOKIE = process.env.QUALITY_COOKIE || '';
 
 if (!BOT_TOKEN || !APP_TOKEN) {
@@ -75,13 +109,17 @@ const app = new App({ token: BOT_TOKEN, appToken: APP_TOKEN, socketMode: true })
 const readClient = USER_TOKEN ? new bolt.webApi.WebClient(USER_TOKEN) : app.client;
 
 // ---- spec list (for the picker) — from the GitHub tree, cached ---------------
-let specCache = { at: 0, specs: [] };
-async function listSpecs() {
-    if (Date.now() - specCache.at < 10 * 60 * 1000 && specCache.specs.length) return specCache.specs;
+const specCache = new Map(); // `${repo}@${branch}|${filter}` → { at, specs }
+async function listSpecs(cfg) {
+    if (!cfg.repo) throw new Error('no specs repo configured — set AUTOFIX_REPO or AUTOFIX_CHANNEL_CONFIG');
+    const key = `${cfg.repo}@${cfg.branch || 'default'}|${cfg.filter}`;
+    const hit = specCache.get(key);
+    if (hit && Date.now() - hit.at < 10 * 60 * 1000 && hit.specs.length) return hit.specs;
+    const filters = (cfg.filter || '').split(',').map((f) => f.trim().toLowerCase()).filter(Boolean);
     const headers = { Accept: 'application/vnd.github+json' };
     if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
     const res = await fetch(
-        `https://api.github.com/repos/${REPO}/git/trees/${BRANCH}?recursive=1`,
+        `https://api.github.com/repos/${cfg.repo}/git/trees/${cfg.branch || 'HEAD'}?recursive=1`,
         { headers },
     );
     if (!res.ok) throw new Error(`GitHub tree ${res.status}`);
@@ -90,9 +128,9 @@ async function listSpecs() {
         .map((t) => t.path)
         .filter((p) => /\.(cy|spec|test)\.[jt]sx?$/i.test(p))
         .filter((p) => !p.includes('obsolete') && !p.includes('obselete'))
-        .filter((p) => SPEC_FILTERS.some((f) => p.toLowerCase().includes(f)))
+        .filter((p) => !filters.length || filters.some((f) => p.toLowerCase().includes(f)))
         .sort();
-    specCache = { at: Date.now(), specs };
+    specCache.set(key, { at: Date.now(), specs });
     return specs;
 }
 
@@ -105,12 +143,12 @@ function specOption(spec) {
     };
 }
 
-function confirmDialog(specLabel) {
+function confirmDialog(specLabel, repo) {
     return {
         title: { type: 'plain_text', text: 'Start auto-fix?' },
         text: {
             type: 'mrkdwn',
-            text: `Reruns \`${specLabel}\`, self-heals it with the local AI CLI, re-verifies, and opens a *draft PR* on ${REPO}.`,
+            text: `Reruns \`${specLabel}\`, self-heals it with the local AI CLI, re-verifies, and opens a *draft PR* on ${repo}.`,
         },
         confirm: { type: 'plain_text', text: 'Start' },
         deny: { type: 'plain_text', text: 'Cancel' },
@@ -147,6 +185,7 @@ async function qualityCookie() {
 }
 
 async function fetchFailedSpecs(reportId) {
+    if (!QUALITY_URL) throw new Error('QUALITY_URL not set — configure the quality dashboard base URL in .env');
     if (reportCache.has(reportId)) return reportCache.get(reportId);
     const cookie = await qualityCookie();
     const res = await fetch(`${QUALITY_URL}/api/insights/cypress/${reportId}`, {
@@ -593,9 +632,9 @@ function failureContextFor(entry) {
  * session never degrades the UI; it just asks for a re-login in the modal.
  * The legacy full-spec dropdown remains only for messages with no Report link.
  */
-async function pickerBlocksFor(msg, failedCount) {
+async function pickerBlocksFor(msg, failedCount, cfg) {
     const reportId = extractReportId(msg);
-    if (!reportId) return specPickerBlocks(failedCount);
+    if (!reportId) return specPickerBlocks(failedCount, cfg);
     return [
         {
             type: 'section',
@@ -898,8 +937,8 @@ app.view('autofix_modal', async ({ ack, body, view, client }) => {
     });
 });
 
-async function specPickerBlocks(failedCount) {
-    const specs = await listSpecs();
+async function specPickerBlocks(failedCount, cfg) {
+    const specs = await listSpecs(cfg);
     return [
         {
             type: 'section',
@@ -914,20 +953,21 @@ async function specPickerBlocks(failedCount) {
                 action_id: 'autofix_pick',
                 placeholder: { type: 'plain_text', text: 'Select a spec…' },
                 options: specs.slice(0, 100).map(specOption),
-                confirm: confirmDialog('the selected spec'),
+                confirm: confirmDialog('the selected spec', cfg.repo),
             },
         },
     ];
 }
 
 // ---- portal client ------------------------------------------------------------
-async function startHeal(spec, failureContext) {
+async function startHeal(spec, failureContext, cfg) {
+    if (!cfg?.repo) throw new Error('no specs repo configured for this channel — set AUTOFIX_REPO or AUTOFIX_CHANNEL_CONFIG');
     const res = await fetch(`${PORTAL}/api/heal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-            repoUrl: REPO,
-            branch: BRANCH,
+            repoUrl: cfg.repo,
+            branch: cfg.branch || '',
             spec,
             openPr: true,
             cliType: 'claude',
@@ -946,7 +986,7 @@ async function pollHeal(jobId) {
 }
 
 // ---- run a heal and thread progress under the triggering message --------------
-async function runAndReport({ client, channel, threadTs, user, spec, failureContext }) {
+async function runAndReport({ client, channel, threadTs, user, spec, failureContext, cfg }) {
     const say = (text) =>
         client.chat.postMessage({ channel, thread_ts: threadTs, text }).catch(() => {});
 
@@ -959,7 +999,7 @@ async function runAndReport({ client, channel, threadTs, user, spec, failureCont
 
     let jobId;
     try {
-        jobId = await startHeal(spec, failureContext);
+        jobId = await startHeal(spec, failureContext, cfg || (await cfgForChannelId(channel)));
     } catch (e) {
         await say(`:x: Could not start the heal: ${e.message}\nIs the QA portal running at ${PORTAL}?`);
         return;
@@ -1020,7 +1060,9 @@ app.event('message', async ({ event, client }) => {
 
         seenReports.add(event.ts);
         if (seenReports.size > 500) seenReports.clear(); // bounded memory
-        const blocks = crash ? crashButtonBlocks(crash) : await pickerBlocksFor(event, failed);
+        const blocks = crash
+            ? crashButtonBlocks(crash)
+            : await pickerBlocksFor(event, failed, await cfgForChannelId(event.channel));
         await client.chat.postMessage({
             channel: event.channel,
             thread_ts: event.ts,
@@ -1106,7 +1148,7 @@ function failedTestCard({ spec, testName }) {
                     text: { type: 'plain_text', text: '🔧 Auto-fix & PR' },
                     action_id: 'autofix_run',
                     value: JSON.stringify({ spec }),
-                    confirm: confirmDialog(spec),
+                    confirm: confirmDialog(spec, cfgForName(CHANNEL).repo || 'the specs repo'),
                 },
             ],
         },
@@ -1144,10 +1186,11 @@ function failedCountOf(msg) {
  * picker under it. Lets the flow be demoed on an EXISTING report instead of
  * waiting for CI to post a new one.
  */
-async function scanAndThread(client, maxReports = 1) {
+async function scanAndThread(client, maxReports = 1, scanChannel = CHANNEL) {
     // History reads go through readClient (user token if set — no membership
     // needed); the picker itself is posted by the bot via chat:write.public.
-    const channel = await channelIdByName(readClient, CHANNEL);
+    if (!scanChannel) throw new Error('no channel — set SLACK_AUTOFIX_CHANNEL or pass one: scan [N] [#channel]');
+    const channel = await channelIdByName(readClient, scanChannel);
     const hist = await readClient.conversations.history({ channel, limit: 10 });
     let threaded = 0;
     for (const msg of hist.messages || []) {
@@ -1166,7 +1209,7 @@ async function scanAndThread(client, maxReports = 1) {
                 continue;
             }
         }
-        const blocks = crash ? crashButtonBlocks(crash) : await pickerBlocksFor(msg, failed);
+        const blocks = crash ? crashButtonBlocks(crash) : await pickerBlocksFor(msg, failed, cfgForName(scanChannel));
         await client.chat.postMessage({
             channel,
             thread_ts: msg.ts,
@@ -1254,7 +1297,8 @@ if (cmd === 'crash-rca') {
         process.exit(1);
     });
 } else if (cmd === 'scan') {
-    scanAndThread(app.client, Math.max(1, Number(specArg) || 1))
+    const chanArg = [specArg, ...nameParts].find((a) => a?.startsWith('#'));
+    scanAndThread(app.client, Math.max(1, Number(specArg) || 1), chanArg || CHANNEL)
         .then(() => process.exit(0))
         .catch((e) => {
             console.error(`Scan failed: ${e.message}`);
@@ -1283,7 +1327,9 @@ if (cmd === 'crash-rca') {
     (async () => {
         await app.start();
         console.log('⚡ QA Auto-fix bot connected (Socket Mode).');
-        console.log(`   Portal: ${PORTAL} · Repo: ${REPO}@${BRANCH} · Channel: ${CHANNEL}`);
+        console.log(`   Portal: ${PORTAL} · Default repo: ${REPO || '(unset)'}${BRANCH ? '@' + BRANCH : ''} · Default channel: ${CHANNEL || '(unset)'}`);
+        const mapped = Object.keys(CHANNEL_CONFIG);
+        if (mapped.length) console.log(`   Channel map: ${mapped.map((c) => `${c} → ${CHANNEL_CONFIG[c].repo || REPO}`).join(' · ')}`);
         console.log('   Watching for "Cypress Test Reporter" failure reports; will thread a spec picker.');
         console.log('   Manual card:  node scripts/slack-autofix-bot.mjs post <spec-path> [test name]');
     })();

@@ -60,6 +60,24 @@ npm start                   # long-lived bot process
    - `QUALITY_URL` — quality dashboard base; leave `QUALITY_COOKIE` blank to
      read the session live from Chrome
 
+### Multi-team / multi-channel use
+
+Everything a team changes lives in `.env` — no code edits:
+
+- `SLACK_AUTOFIX_CHANNEL`, `AUTOFIX_REPO`, `AUTOFIX_BRANCH`, `AUTOFIX_SPEC_FILTER`
+  set the default channel and the specs repo PRs are opened against.
+- `AUTOFIX_CHANNEL_CONFIG` (JSON) maps **each channel to its own repo/branch/
+  filter**, so one bot instance can serve e.g. hotels, flights and transport
+  channels, healing into different repos:
+
+  ```
+  AUTOFIX_CHANNEL_CONFIG={"#hotel-cypress-logs":{"repo":"org/hotel-specs","filter":"hotel"},"#flights-cypress-logs":{"repo":"org/flight-specs","filter":"flight"}}
+  ```
+
+- `scan` accepts a channel too: `node slack-autofix-bot.mjs scan 2 "#flights-cypress-logs"`.
+- There are no hardcoded org defaults in the code — with nothing configured the
+  bot fails fast with a clear message instead of pointing at someone else's repo.
+
 ## Commands
 
 ```bash

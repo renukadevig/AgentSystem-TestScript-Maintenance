@@ -24,77 +24,29 @@
  *   AUTOFIX_BRANCH=master
  *   AUTOFIX_SPEC_FILTER=                    (substring(s) for the spec picker, comma-sep)
  */
-import fs from 'node:fs';
-import path from 'node:path';
-import { spawn } from 'node:child_process';
-import crypto from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import bolt from '@slack/bolt';
-import { getQualityCookieHeader } from './quality-cookie.mjs';
-
-// ---- env: load .env.local the same way the portal does -----------------------
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const envFile = path.join(__dirname, '.env');
-if (fs.existsSync(envFile)) {
-    for (const line of fs.readFileSync(envFile, 'utf8').split('\n')) {
-        const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
-        if (m && !(m[1] in process.env)) process.env[m[1]] = m[2];
-    }
-}
-
-const BOT_TOKEN = process.env.SLACK_BOT_TOKEN || '';
-const APP_TOKEN = process.env.SLACK_APP_TOKEN || '';
-// Optional user token (xoxp-…): lets `scan` read channel history AS the user
-// (already a member) so the bot never needs to be invited to the channel.
-const USER_TOKEN = process.env.SLACK_USER_TOKEN || '';
-// ---- team-configurable targets (no hardcoded org defaults) --------------------
-// Global defaults come from .env; AUTOFIX_CHANNEL_CONFIG optionally maps each
-// Slack channel to its own specs repo / branch / spec filter, e.g.:
-//   AUTOFIX_CHANNEL_CONFIG={"#hotel-cypress-logs":{"repo":"org/hotel-specs","branch":"master","filter":"hotel"},
-//                           "#flights-cypress-logs":{"repo":"org/flight-specs","filter":"flight"}}
-const CHANNEL = process.env.SLACK_AUTOFIX_CHANNEL || '';
-const PORTAL = (process.env.PORTAL_URL || 'http://127.0.0.1:8080').replace(/\/+$/, '');
-const REPO = process.env.AUTOFIX_REPO || '';
-const BRANCH = process.env.AUTOFIX_BRANCH || '';
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
-const SPEC_FILTER_RAW = process.env.AUTOFIX_SPEC_FILTER || '';
-
-let CHANNEL_CONFIG = {};
-try {
-    const parsed = JSON.parse(process.env.AUTOFIX_CHANNEL_CONFIG || '{}');
-    for (const [k, v] of Object.entries(parsed)) CHANNEL_CONFIG[k.toLowerCase().replace(/^#?/, '#')] = v;
-} catch (e) {
-    console.error(`AUTOFIX_CHANNEL_CONFIG is not valid JSON — ignoring it (${e.message})`);
-}
-
-/** Effective config for a channel name; channel map wins over global env. */
-function cfgForName(channelName) {
-    const c = CHANNEL_CONFIG[(channelName || '').toLowerCase().replace(/^#?/, '#')] || {};
-    return {
-        repo: c.repo || REPO,
-        branch: c.branch ?? BRANCH,
-        filter: c.filter ?? SPEC_FILTER_RAW,
-        framework: (c.framework || process.env.AUTOFIX_FRAMEWORK || 'cypress').toLowerCase() === 'playwright' ? 'playwright' : 'cypress',
-    };
-}
-
-// channel-id → "#name" cache (interactive payloads carry ids, config uses names)
-const chanNames = new Map();
-async function cfgForChannelId(id) {
-    if (!chanNames.has(id)) {
-        try {
-            const r = await readClient.conversations.info({ channel: id });
-            chanNames.set(id, `#${r.channel?.name || ''}`);
-        } catch {
-            chanNames.set(id, '');
-        }
-    }
-    return cfgForName(chanNames.get(id));
-}
-// Quality dashboard (report source). QUALITY_COOKIE is a logged-in session's
-// Cookie header — the "public" report pages still require an Okta session.
-const QUALITY_URL = (process.env.QUALITY_URL || '').replace(/\/+$/, ''); // quality dashboard base — required for report-driven triage
-const QUALITY_COOKIE = process.env.QUALITY_COOKIE || '';
+import {
+    BOT_TOKEN,
+    APP_TOKEN,
+    USER_TOKEN,
+    CHANNEL,
+    PORTAL,
+    REPO,
+    BRANCH,
+    CHANNEL_CONFIG,
+    cfgForName,
+} from './lib/config.mjs';
+import { analysisCache, loadAnalysisCache } from './lib/store.mjs';
+import { analyzeReport, heuristicAnalysis, CATEGORY_BADGE } from './lib/ai.mjs';
+import {
+    extractReportId,
+    fetchFailedSpecs,
+    failureContextFor,
+    listSpecs,
+    specOption,
+} from './lib/reports.mjs';
+import { extractJenkinsBuild, analyzeCrash, CRASH_BADGE, crashRcaText, shareCrashRca } from './lib/crash.mjs';
+import { startHeal, pollHeal } from './lib/portal.mjs';
 
 if (!BOT_TOKEN || !APP_TOKEN) {
     console.error(
@@ -110,39 +62,18 @@ const app = new App({ token: BOT_TOKEN, appToken: APP_TOKEN, socketMode: true })
 // else the bot token (requires /invite).
 const readClient = USER_TOKEN ? new bolt.webApi.WebClient(USER_TOKEN) : app.client;
 
-// ---- spec list (for the picker) — from the GitHub tree, cached ---------------
-const specCache = new Map(); // `${repo}@${branch}|${filter}` → { at, specs }
-async function listSpecs(cfg) {
-    if (!cfg.repo) throw new Error('no specs repo configured — set AUTOFIX_REPO or AUTOFIX_CHANNEL_CONFIG');
-    const key = `${cfg.repo}@${cfg.branch || 'default'}|${cfg.filter}`;
-    const hit = specCache.get(key);
-    if (hit && Date.now() - hit.at < 10 * 60 * 1000 && hit.specs.length) return hit.specs;
-    const filters = (cfg.filter || '').split(',').map((f) => f.trim().toLowerCase()).filter(Boolean);
-    const headers = { Accept: 'application/vnd.github+json' };
-    if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
-    const res = await fetch(
-        `https://api.github.com/repos/${cfg.repo}/git/trees/${cfg.branch || 'HEAD'}?recursive=1`,
-        { headers },
-    );
-    if (!res.ok) throw new Error(`GitHub tree ${res.status}`);
-    const data = await res.json();
-    const specs = (data.tree || [])
-        .map((t) => t.path)
-        .filter((p) => /\.(cy|spec|test)\.[jt]sx?$/i.test(p))
-        .filter((p) => !p.includes('obsolete') && !p.includes('obselete'))
-        .filter((p) => !filters.length || filters.some((f) => p.toLowerCase().includes(f)))
-        .sort();
-    specCache.set(key, { at: Date.now(), specs });
-    return specs;
-}
-
-// Slack option text is capped at 75 chars — show the path tail, keep full path in value.
-function specOption(spec) {
-    const tail = spec.length > 73 ? `…${spec.slice(-72)}` : spec;
-    return {
-        text: { type: 'plain_text', text: tail },
-        value: spec, // ≤150 chars for repo-relative spec paths
-    };
+// channel-id → "#name" cache (interactive payloads carry ids, config uses names)
+const chanNames = new Map();
+async function cfgForChannelId(id) {
+    if (!chanNames.has(id)) {
+        try {
+            const r = await readClient.conversations.info({ channel: id });
+            chanNames.set(id, `#${r.channel?.name || ''}`);
+        } catch {
+            chanNames.set(id, '');
+        }
+    }
+    return cfgForName(chanNames.get(id));
 }
 
 function confirmDialog(specLabel, repo) {
@@ -156,461 +87,6 @@ function confirmDialog(specLabel, repo) {
         deny: { type: 'plain_text', text: 'Cancel' },
     };
 }
-
-// ---- report-driven failures (quality.almosafer.io) -----------------------------
-// key → { failed: [{ spec, errors: [{ title, message }] }], stats }
-const reportCache = new Map();
-
-// ---- report references: works with ANY report link, not just the dashboard ----
-// Insights links keep their 24-hex id as the key; any other report URL gets a
-// short hash key. Refs are persisted (analysisCache file) so buttons survive
-// bot restarts.
-const reportCategory = new Map();
-const REPORT_LINK_HINT = (process.env.REPORT_LINK_HINT || '').toLowerCase();
-
-function refKeyForUrl(url) {
-    return crypto.createHash('sha1').update(url).digest('hex').slice(0, 12);
-}
-function rememberRef(key, ref) {
-    analysisCache.set(`ref:${key}`, ref);
-    persistAnalysisCache();
-}
-function lookupRef(key) {
-    if (analysisCache.has(`ref:${key}`)) return analysisCache.get(`ref:${key}`);
-    const disk = loadAnalysisCache();
-    return disk.get(`ref:${key}`) || null;
-}
-
-/**
- * Find the report link in a CI message and return a short cache key for it.
- * Priority: quality-dashboard insights link (native JSON API) → any other
- * http(s) link (fetched and parsed generically, AI fallback for HTML/unknown).
- * REPORT_LINK_HINT (env) picks the right link when a message carries several.
- */
-function extractReportId(msg) {
-    const raw = JSON.stringify(msg);
-    const m = raw.match(/public\/insights\/(\w[\w-]*)\/([a-f0-9]{24})/i);
-    if (m) {
-        reportCategory.set(m[2], m[1]);
-        rememberRef(m[2], { kind: 'insights', category: m[1] });
-        return m[2];
-    }
-    // generic report link: any URL except Slack itself and Jenkins build links
-    const urls = (raw.match(/https?:\/\/[^\s"'<>\\|]+/gi) || [])
-        .map((u) => u.replace(/[\\").,]+$/, ''))
-        .filter((u) => !/slack\.com|slack-edge\.com/i.test(u))
-        .filter((u) => !JENKINS_BUILD_RE.test(u))
-        .filter((u) => !/\.(png|jpe?g|gif|svg)(\?|$)/i.test(u));
-    if (!urls.length) return null;
-    const pick = REPORT_LINK_HINT ? urls.find((u) => u.toLowerCase().includes(REPORT_LINK_HINT)) || urls[0] : urls[0];
-    const key = refKeyForUrl(pick);
-    rememberRef(key, { kind: 'generic', url: pick });
-    return key;
-}
-
-// Cookie source: explicit env override, else read live from the user's own
-// Chrome session (scripts/quality-cookie.mjs) — cached briefly.
-let liveCookie = { at: 0, value: '' };
-async function qualityCookie() {
-    if (QUALITY_COOKIE) return QUALITY_COOKIE;
-    if (Date.now() - liveCookie.at < 5 * 60 * 1000 && liveCookie.value) return liveCookie.value;
-    const value = await getQualityCookieHeader(QUALITY_URL);
-    if (!value) throw new Error(`no ${QUALITY_URL || 'quality dashboard'} session in Chrome — log in there first`);
-    liveCookie = { at: Date.now(), value };
-    return value;
-}
-
-// ---- format parsers → the shared { failed:[{spec,errors:[{title,message}]}], stats } shape ----
-
-/** Our quality dashboard's shape: results[]/buildResults[].results[] suites. */
-function parseDashboardReport(data) {
-    const report = data?.report || data?.rawReport || data?.data?.report || data?.data || data;
-    const suites = [...(report?.results || []), ...(report?.buildResults || []).flatMap((b) => b?.results || [])];
-    if (!suites.length) return null;
-    const bySpec = new Map();
-    for (const suite of suites) {
-        const spec = suite?._flattenMetadata?.filePath || suite?.file || '';
-        if (!spec) continue;
-        for (const t of suite?.tests || []) {
-            if ((t.state || '').toLowerCase() !== 'failed') continue;
-            if (!bySpec.has(spec)) bySpec.set(spec, []);
-            bySpec.get(spec).push({ title: t.fullTitle || t.title || '(untitled test)', message: t.err?.message || '(no error message captured)' });
-        }
-    }
-    const st = report?.stats || {};
-    return {
-        failed: [...bySpec.entries()].map(([spec, errors]) => ({ spec, errors })),
-        stats: { total: st.tests ?? null, passed: st.passes ?? null, failed: st.failures ?? null, skipped: (st.skipped ?? 0) + (st.pending ?? 0) || null },
-    };
-}
-
-/** mochawesome merged JSON: results[] with nested suites[]/tests[]. */
-function parseMochawesome(data) {
-    if (!data?.stats || !Array.isArray(data?.results)) return null;
-    const bySpec = new Map();
-    const walk = (node, file) => {
-        const f = node.fullFile || node.file || file || '';
-        for (const t of node.tests || []) {
-            if ((t.state || '').toLowerCase() !== 'failed') continue;
-            const spec = f || 'unknown';
-            if (!bySpec.has(spec)) bySpec.set(spec, []);
-            bySpec.get(spec).push({ title: t.fullTitle || t.title || '(untitled)', message: t.err?.message || t.err?.estack || '(no error captured)' });
-        }
-        for (const su of node.suites || []) walk(su, f);
-    };
-    for (const r of data.results) walk(r, r.fullFile || r.file);
-    const st = data.stats;
-    return {
-        failed: [...bySpec.entries()].map(([spec, errors]) => ({ spec: spec.replace(/^.*?(cypress|tests?|e2e)\//, '$1/'), errors })),
-        stats: { total: st.tests ?? null, passed: st.passes ?? null, failed: st.failures ?? null, skipped: (st.pending ?? 0) + (st.skipped ?? 0) || null },
-    };
-}
-
-/** Playwright JSON reporter: suites[].specs[].tests[].results[].status. */
-function parsePlaywrightJson(data) {
-    if (!Array.isArray(data?.suites)) return null;
-    const bySpec = new Map();
-    let total = 0, passed = 0, failedN = 0, skipped = 0;
-    const walk = (suite) => {
-        for (const sp of suite.specs || []) {
-            for (const t of sp.tests || []) {
-                total += 1;
-                const results = t.results || [];
-                const status = results[results.length - 1]?.status || '';
-                if (status === 'passed') passed += 1;
-                else if (status === 'skipped') skipped += 1;
-                else if (status) {
-                    failedN += 1;
-                    const spec = sp.file || suite.file || 'unknown';
-                    if (!bySpec.has(spec)) bySpec.set(spec, []);
-                    bySpec.get(spec).push({ title: sp.title || t.title || '(untitled)', message: results[results.length - 1]?.error?.message || `status: ${status}` });
-                }
-            }
-        }
-        for (const su of suite.suites || []) walk(su);
-    };
-    for (const su of data.suites) walk(su);
-    if (!total) return null;
-    return { failed: [...bySpec.entries()].map(([spec, errors]) => ({ spec, errors })), stats: { total, passed, failed: failedN, skipped: skipped || null } };
-}
-
-/** Universal fallback: let the AI read ANY report (HTML page, custom JSON,
- *  plain text) and extract the failed tests as structured data. */
-async function aiExtractFailures(content) {
-    const text = content
-        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&\w+;/g, ' ')
-        .replace(/\s{3,}/g, '\n')
-        .slice(0, 30000);
-    const prompt = `You are reading a QA test-run report (format unknown — could be extracted HTML, JSON or text). Identify the FAILED tests.
-
-Return ONLY JSON:
-{"stats": {"total": <n|null>, "passed": <n|null>, "failed": <n|null>, "skipped": <n|null>},
- "failures": [{"spec": "<spec/test file path, '' if not shown>", "title": "<test name>", "error": "<error message, max 300 chars>"}]}
-
-REPORT CONTENT:
-${text}`;
-    const out = await runClaudeQuick(prompt);
-    const m = out.match(/\{[\s\S]*\}/);
-    if (!m) throw new Error('AI could not extract failures from the report');
-    const parsed = JSON.parse(m[0]);
-    const bySpec = new Map();
-    for (const f of parsed.failures || []) {
-        const spec = f.spec || '';
-        if (!bySpec.has(spec)) bySpec.set(spec, []);
-        bySpec.get(spec).push({ title: f.title || '(untitled)', message: f.error || '' });
-    }
-    return {
-        failed: [...bySpec.entries()].map(([spec, errors]) => ({ spec, errors })),
-        stats: parsed.stats || { total: null, passed: null, failed: (parsed.failures || []).length, skipped: null },
-    };
-}
-
-/**
- * Universal failure fetcher. Insights ids use the dashboard JSON API; any
- * other report URL is fetched (operator Chrome session first, anonymous
- * fallback) and parsed: known JSON shapes natively, everything else via AI.
- */
-async function fetchFailedSpecs(key) {
-    if (reportCache.has(key)) return reportCache.get(key);
-    const ref = lookupRef(key) || (/^[a-f0-9]{24}$/i.test(key) ? { kind: 'insights', category: reportCategory.get(key) || 'cypress' } : null);
-    if (!ref) throw new Error('unknown report reference — re-run scan on this message');
-
-    let entry;
-    if (ref.kind === 'insights') {
-        if (!QUALITY_URL) throw new Error('QUALITY_URL not set — configure the quality dashboard base URL in .env');
-        const cookie = await qualityCookie();
-        const res = await fetch(`${QUALITY_URL}/api/insights/${ref.category || 'cypress'}/${key}`, {
-            headers: { cookie, 'user-agent': 'qa-autofix-bot' },
-            redirect: 'manual',
-        });
-        if (res.status >= 300 && res.status < 400) {
-            liveCookie = { at: 0, value: '' };
-            throw new Error(`quality session expired — log in to ${QUALITY_URL} in Chrome`);
-        }
-        if (!res.ok) throw new Error(`quality API ${res.status}`);
-        entry = parseDashboardReport(await res.json());
-        if (!entry) throw new Error('dashboard report had no suites');
-    } else {
-        // generic URL: try the operator's Chrome session, fall back to anonymous
-        let cookie = '';
-        try { cookie = await cookieFor(ref.url); } catch { /* public report */ }
-        const res = await fetch(ref.url, { headers: { ...(cookie ? { cookie } : {}), 'user-agent': 'qa-autofix-bot' } });
-        if (!res.ok) throw new Error(`report fetch ${res.status} from ${new URL(ref.url).hostname}`);
-        const bodyText = await res.text();
-        let json = null;
-        try { json = JSON.parse(bodyText); } catch { /* not JSON */ }
-        entry = (json && (parseDashboardReport(json) || parseMochawesome(json) || parsePlaywrightJson(json))) || null;
-        if (!entry || !entry.failed.length) entry = await aiExtractFailures(bodyText);
-    }
-
-    reportCache.set(key, entry);
-    if (reportCache.size > 50) reportCache.delete(reportCache.keys().next().value);
-    return entry;
-}
-
-// ---- AI root-cause triage (fast Haiku pass over the report's errors) ----------
-const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude';
-// Model for the pre-modal root-cause triage. Fable 5 for analysis quality;
-// override with AUTOFIX_ANALYSIS_MODEL (e.g. "haiku" for speed).
-const ANALYSIS_MODEL = process.env.AUTOFIX_ANALYSIS_MODEL || 'claude-fable-5';
-// Disk-backed so the short-lived `scan` process can pre-warm the triage and
-// the long-running bot picks it up on click (separate processes, shared file).
-const ANALYSIS_CACHE_FILE = path.join(__dirname, '.analysis-cache.json');
-function loadAnalysisCache() {
-    try {
-        return new Map(Object.entries(JSON.parse(fs.readFileSync(ANALYSIS_CACHE_FILE, 'utf8'))));
-    } catch {
-        return new Map();
-    }
-}
-const analysisCache = loadAnalysisCache(); // reportId → [{rootCause, category}] aligned with failed[]
-function persistAnalysisCache() {
-    try {
-        fs.writeFileSync(ANALYSIS_CACHE_FILE, JSON.stringify(Object.fromEntries(analysisCache)));
-    } catch {
-        /* cache persistence is best-effort */
-    }
-}
-const analysisInFlight = new Map(); // reportId → Promise
-
-const CATEGORY_BADGE = {
-    TEST_CODE: '🔧 likely test-code fix',
-    PRODUCT_BUG: '🐞 possible product bug',
-    ENVIRONMENT: '🌐 environment/access issue',
-    UNCLEAR: '❓ unclear — needs a look',
-};
-
-function runClaudeQuick(prompt, { timeoutMs = 240_000 } = {}) {
-    return new Promise((resolve, reject) => {
-        const env = { ...process.env };
-        delete env.NODE_OPTIONS;
-        if (CLAUDE_CLI.includes('/')) env.PATH = `${path.dirname(CLAUDE_CLI)}:${env.PATH || ''}`;
-        const child = spawn(CLAUDE_CLI, ['-p', prompt, '--model', ANALYSIS_MODEL, '--output-format', 'text'], {
-            env,
-            stdio: ['ignore', 'pipe', 'pipe'],
-        });
-        let out = '';
-        let err = '';
-        const timer = setTimeout(() => {
-            child.kill('SIGKILL');
-            reject(new Error(`analysis timed out after ${timeoutMs}ms`));
-        }, timeoutMs);
-        child.stdout.on('data', (d) => (out += d));
-        child.stderr.on('data', (d) => (err += d));
-        child.on('error', (e) => {
-            clearTimeout(timer);
-            reject(e);
-        });
-        child.on('close', (code) => {
-            clearTimeout(timer);
-            if (code === 0) resolve(out);
-            else reject(new Error(`claude exited ${code}: ${(err || out).slice(-200)}`));
-        });
-    });
-}
-
-/**
- * One fast AI pass over ALL failed specs of a report → short root cause +
- * category per spec. Cached per report; concurrent callers share one run.
- * Falls back to the heuristic classifier when the CLI is unavailable.
- */
-async function analyzeReport(reportId, failed) {
-    if (!analysisCache.has(reportId)) {
-        // Another process (scan pre-warm) may have written it since startup.
-        const disk = loadAnalysisCache();
-        if (disk.has(reportId)) analysisCache.set(reportId, disk.get(reportId));
-    }
-    if (analysisCache.has(reportId)) return analysisCache.get(reportId);
-    if (analysisInFlight.has(reportId)) return analysisInFlight.get(reportId);
-
-    const run = (async () => {
-        const specsBlock = failed
-            .slice(0, 10)
-            .map((entry, i) => {
-                const errs = entry.errors
-                    .slice(0, 5)
-                    .map((e) => `  - test: ${e.title.slice(0, 160)}\n    error: ${e.message.replace(/\s+/g, ' ').slice(0, 500)}`)
-                    .join('\n');
-                return `[${i}] ${entry.spec}\n${errs}${entry.errors.length > 5 ? `\n  (+${entry.errors.length - 5} more failures)` : ''}`;
-            })
-            .join('\n\n');
-
-        const prompt = `You are a senior QA automation engineer triaging end-to-end test failures from a CI run.
-
-For EACH failed spec below, infer the most likely root cause from its error message(s) and classify it.
-
-Rules:
-- rootCause: ONE sentence, max 25 words, concrete (name the selector/assertion/page if visible in the error). No hedging filler.
-- category: "TEST_CODE" (selector drift, bad wait, stale assertion — automation can fix), "PRODUCT_BUG" (app/data genuinely wrong — must NOT be forced green), "ENVIRONMENT" (page unreachable, 403, infra), or "UNCLEAR".
-- Same-pattern failures within a spec share one root cause.
-
-Return ONLY a JSON array, no prose, one item per spec index:
-[{"i": 0, "rootCause": "...", "category": "TEST_CODE"}, ...]
-
-Failed specs:
-${specsBlock}`;
-
-        const out = await runClaudeQuick(prompt);
-        const m = out.match(/\[[\s\S]*\]/);
-        if (!m) throw new Error('no JSON in analysis output');
-        const arr = JSON.parse(m[0]);
-        const results = failed.map((entry, i) => {
-            const hit = arr.find((a) => Number(a.i) === i) || {};
-            return {
-                rootCause: (hit.rootCause || classifyError(entry.errors[0]?.message)).slice(0, 240),
-                category: CATEGORY_BADGE[hit.category] ? hit.category : 'UNCLEAR',
-            };
-        });
-        analysisCache.set(reportId, results);
-        if (analysisCache.size > 50) analysisCache.delete(analysisCache.keys().next().value);
-        persistAnalysisCache();
-        return results;
-    })().finally(() => analysisInFlight.delete(reportId));
-
-    analysisInFlight.set(reportId, run);
-    return run;
-}
-
-/** Heuristic-only fallback rows, shaped like analyzeReport's output. */
-function heuristicAnalysis(failed) {
-    return failed.map((entry) => ({
-        rootCause: classifyError(entry.errors[0]?.message),
-        category: 'UNCLEAR',
-    }));
-}
-
-// ---- Jenkins crash analysis (console-log driven, no report exists) -------------
-const JENKINS_BUILD_RE = /https?:\/\/[^\s"'<>\\|]+\/job\/[^\s"'<>\\|]+?\/(\d+)\/?/i;
-
-/** Detect a Jenkins Crash Monitor message and return its build URL (+ any
- *  question the monitor asked in its Action line, so the AI can answer it). */
-function extractJenkinsBuild(msg) {
-    const raw = JSON.stringify(msg);
-    if (!/Jenkins Crash/i.test(raw)) return null;
-    const m = raw.match(JENKINS_BUILD_RE);
-    if (!m) return null;
-    const url = m[0].replace(/\\+$/, '').replace(/\/?$/, '/');
-    const job = (url.match(/\/job\/(.+?)\/\d+\/$/) || [])[1]?.replace(/\/job\//g, '/') || 'unknown-job';
-    // "Action: 👥 Hotel Team: @Renuka - DO WE NEED TO MAKE SMALL JOB!!" → the question part
-    let question = '';
-    const qi = raw.indexOf('Action:');
-    if (qi >= 0) {
-        question = raw
-            .slice(qi + 7, qi + 260)
-            .split('\\n')[0]
-            .replace(/<[^>]*>/g, '')
-            .replace(/:[a-z_]+:/g, '')
-            .replace(/\\+u[0-9a-f]{4}/gi, '')
-            .replace(/["\\]/g, '')
-            .trim();
-    }
-    return { url, job, build: m[1], question };
-}
-
-/** Session cookie for any internal host, read live from Chrome (cached 5 min). */
-const hostCookies = new Map();
-async function cookieFor(baseUrl) {
-    const host = new URL(baseUrl).hostname;
-    const hit = hostCookies.get(host);
-    if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.value;
-    const value = await getQualityCookieHeader(baseUrl);
-    if (!value) throw new Error(`no ${host} session in Chrome — log in there first`);
-    hostCookies.set(host, { at: Date.now(), value });
-    return value;
-}
-
-/**
- * Condense a (potentially huge) Jenkins console log for analysis: keep the
- * head (job setup), every error-ish line, and a generous tail (where the
- * timeout/abort actually shows).
- */
-function condenseConsoleLog(text) {
-    const lines = text.split(/\r?\n/);
-    const head = lines.slice(0, 20);
-    const errRe = /error|failed|failing|timeout|timed out|exception|aborted|killed|OOM|ECONN|✖|✗|CypressError|AssertionError|Executing spec|Running: |spec\.js/i;
-    const errLines = lines.filter((l) => errRe.test(l)).slice(-150);
-    const tail = text.slice(-6000);
-    return `--- HEAD ---\n${head.join('\n')}\n\n--- ERROR-MATCHED LINES ---\n${errLines.join('\n')}\n\n--- TAIL ---\n${tail}`;
-}
-
-/** Fetch + AI-analyze a crashed Jenkins build's console log. Cached. */
-async function analyzeCrash(buildUrl, jobLabel, question = '') {
-    const key = `crash:${buildUrl}`;
-    if (!analysisCache.has(key)) {
-        const disk = loadAnalysisCache();
-        if (disk.has(key)) analysisCache.set(key, disk.get(key));
-    }
-    if (analysisCache.has(key)) return analysisCache.get(key);
-    if (analysisInFlight.has(key)) return analysisInFlight.get(key);
-
-    const run = (async () => {
-        const cookie = await cookieFor(buildUrl);
-        const res = await fetch(`${buildUrl}consoleText`, { headers: { cookie }, redirect: 'manual' });
-        if (!res.ok) throw new Error(`Jenkins consoleText ${res.status} — check VPN / Jenkins login in Chrome`);
-        const log = await res.text();
-        const condensed = condenseConsoleLog(log);
-
-        const prompt = `You are a senior CI/QA engineer investigating a CRASHED/TIMED-OUT Jenkins build of a Cypress E2E job.
-
-Job: ${jobLabel}
-Below is a condensed console log (head + error-matched lines + tail). Determine what the build was doing when it died and why.
-
-Return ONLY a JSON object:
-{
-  "rootCause": "<one sentence, max 30 words, concrete>",
-  "stuckAt": "<the stage/spec/test it was executing when it stalled, or 'unknown'>",
-  "category": "TEST_HANG" | "INFRA" | "APP" | "TOO_BIG_JOB" | "UNCLEAR",
-  "recommendation": "<one actionable sentence: e.g. split the job, fix a hanging spec (name it), raise a specific timeout, infra fix>"${
-      question ? `,\n  "answerToTeamQuestion": "<direct yes/no + one-line reason answering: ${question.replace(/"/g, "'")}>"` : ''
-  }
-}
-
-CONSOLE LOG (condensed from ${log.length} chars):
-${condensed.slice(0, 24000)}`;
-
-        const out = await runClaudeQuick(prompt);
-        const m = out.match(/\{[\s\S]*\}/);
-        if (!m) throw new Error('no JSON in crash analysis output');
-        const result = { ...JSON.parse(m[0]), logChars: log.length };
-        analysisCache.set(key, result);
-        persistAnalysisCache();
-        return result;
-    })().finally(() => analysisInFlight.delete(key));
-
-    analysisInFlight.set(key, run);
-    return run;
-}
-
-const CRASH_BADGE = {
-    TEST_HANG: '🪝 hanging test',
-    INFRA: '🌐 infrastructure',
-    APP: '🐞 application issue',
-    TOO_BIG_JOB: '📦 job too big / needs splitting',
-    UNCLEAR: '❓ unclear',
-};
 
 /** Thread reply blocks for a crash message. */
 function crashButtonBlocks(build) {
@@ -635,32 +111,6 @@ function crashButtonBlocks(build) {
             ],
         },
     ];
-}
-
-/** RCA text for the thread (team-visible — crashes have no auto-fix step). */
-function crashRcaText(jobLabel, buildNo, a, buildUrl) {
-    return (
-        `🧠 *AI Crash Analysis — \`${jobLabel} #${buildNo}\`* · ${CRASH_BADGE[a.category] || a.category}\n` +
-        `*Root cause:* ${a.rootCause}\n` +
-        `*Stuck at:* ${a.stuckAt}\n` +
-        `*Recommendation:* ${a.recommendation}` +
-        (a.answerToTeamQuestion ? `\n💬 *Re: the team's question* — ${a.answerToTeamQuestion}` : '') +
-        `\n_Analyzed ${Math.round((a.logChars || 0) / 1000)}k chars of console log · <${buildUrl}console|full log>_`
-    );
-}
-
-/** Post the RCA into the thread once per build (dedupe via the cache entry). */
-async function shareCrashRca({ client, channel, threadTs, buildUrl, jobLabel, buildNo, a }) {
-    if (a.sharedTs) return;
-    a.sharedTs = 'posting'; // claim synchronously — concurrent clickers bail out here
-    const res = await client.chat.postMessage({
-        channel,
-        thread_ts: threadTs,
-        text: crashRcaText(jobLabel, buildNo, a, buildUrl),
-    });
-    a.sharedTs = res.ts;
-    analysisCache.set(`crash:${buildUrl}`, a);
-    persistAnalysisCache();
 }
 
 // ---- crash button → loading modal → console-log AI analysis ---------------------
@@ -804,14 +254,6 @@ app.action('crash_analyse', async ({ ack, body, client, action }) => {
     });
 });
 
-/** Turn a spec's failures into the CI context the heal prompt consumes. */
-function failureContextFor(entry) {
-    const parts = entry.errors
-        .slice(0, 10)
-        .map((e, i) => `${i + 1}) ${e.title}\n${e.message}`);
-    return `Failed tests in ${entry.spec} (from the CI run report):\n\n${parts.join('\n\n')}`;
-}
-
 /**
  * Thread reply for a reporter message: ALWAYS the Auto-fix button when the
  * message links a report — no data fetching at post time. The report detail
@@ -835,30 +277,6 @@ async function pickerBlocksFor(msg, failedCount, cfg) {
 }
 
 const specName = (spec) => spec.split('/').pop();
-
-/**
- * Instant, heuristic root-cause classification of a Cypress error message —
- * shown in the spec-selection modal so the human can triage at a glance.
- * (Deliberately not an LLM call: the modal must open within Slack's 3s
- * trigger window; the full AI analysis happens after selection anyway.)
- */
-function classifyError(msg = '') {
-    const m = msg.toLowerCase();
-    if (/expected to find element/.test(m)) {
-        const sel = (msg.match(/`([^`]+)`/) || [])[1];
-        return `Selector not found${sel ? ` (\`${sel.slice(0, 60)}\`)` : ''} — likely selector drift after a UI change`;
-    }
-    if (/being covered|is covered by|not visible|element is detached/.test(m))
-        return 'Element not clickable (covered/hidden/detached) — overlay or timing issue';
-    if (/event_assertion|event should exist/.test(m))
-        return 'Analytics event not fired — possible product bug, will NOT be forced green';
-    if (/cy\.visit\(\)|failed trying to load|net::|econnrefused|403 forbidden/.test(m))
-        return 'Page failed to load — environment/access issue, not test code';
-    if (/expected .+ to (equal|eq|deep|contain|match|have length)/.test(m))
-        return 'Assertion/data mismatch — expected vs actual differ; could be data drift or a product change';
-    if (/timed out retrying/.test(m)) return 'Timeout waiting for app state — wait/sync issue or slow environment';
-    return (msg.split('\n')[0] || 'Unclassified failure').slice(0, 120);
-}
 
 /** Thread reply: CI summary (reporter's own style) + an Auto-fix button that
  *  opens the spec-selection modal. */
@@ -1144,33 +562,6 @@ async function specPickerBlocks(failedCount, cfg) {
             },
         },
     ];
-}
-
-// ---- portal client ------------------------------------------------------------
-async function startHeal(spec, failureContext, cfg) {
-    if (!cfg?.repo) throw new Error('no specs repo configured for this channel — set AUTOFIX_REPO or AUTOFIX_CHANNEL_CONFIG');
-    const res = await fetch(`${PORTAL}/api/heal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            repoUrl: cfg.repo,
-            branch: cfg.branch || '',
-            spec,
-            openPr: true,
-            cliType: 'claude',
-            framework: cfg.framework || 'cypress',
-            failureContext: failureContext || '',
-        }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || `portal responded ${res.status}`);
-    return data.jobId;
-}
-
-async function pollHeal(jobId) {
-    const res = await fetch(`${PORTAL}/api/heal/${jobId}`, { cache: 'no-store' });
-    if (!res.ok) throw new Error(`poll failed: ${res.status}`);
-    return res.json();
 }
 
 // ---- run a heal and thread progress under the triggering message --------------

@@ -1515,6 +1515,26 @@ if (cmd === 'crash-rca') {
     (async () => {
         await app.start();
         console.log('⚡ QA Auto-fix bot connected (Socket Mode).');
+
+        // Scheduled scan: real-time-ish auto-threading WITHOUT needing the bot
+        // invited to the channel (history reads use the user token). Covers the
+        // default channel plus every channel in AUTOFIX_CHANNEL_CONFIG.
+        const intervalMin = Number(process.env.SCAN_INTERVAL_MINUTES || 0);
+        if (intervalMin > 0) {
+            const channels = [...new Set([CHANNEL, ...Object.keys(CHANNEL_CONFIG)].filter(Boolean))];
+            const tick = async () => {
+                for (const ch of channels) {
+                    try {
+                        await scanAndThread(app.client, 3, ch);
+                    } catch (e) {
+                        console.error(`[poll ${ch}] ${e.message}`);
+                    }
+                }
+            };
+            setInterval(tick, intervalMin * 60 * 1000);
+            console.log(`   Auto-scan: ${channels.join(', ')} every ${intervalMin} min (SCAN_INTERVAL_MINUTES=0 to disable).`);
+            tick();
+        }
         console.log(`   Portal: ${PORTAL} · Default repo: ${REPO || '(unset)'}${BRANCH ? '@' + BRANCH : ''} · Default channel: ${CHANNEL || '(unset)'}`);
         const mapped = Object.keys(CHANNEL_CONFIG);
         if (mapped.length) console.log(`   Channel map: ${mapped.map((c) => `${c} → ${CHANNEL_CONFIG[c].repo || REPO}`).join(' · ')}`);

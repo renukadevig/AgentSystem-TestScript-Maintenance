@@ -187,8 +187,12 @@ node slack-autofix-bot.mjs post <spec> [name]  # manual one-off failed-test card
 - **Report picker** shows only the specs that actually failed (spec file names,
   root cause as the subtitle; full paths in the triage list).
 - **Crash RCAs post once per build** — repeat clicks reuse the cached analysis.
-- The **auto-watcher** (reacting to new messages without `scan`) requires the
-  bot to be a channel member; without an invite, use `scan [N]`.
+- **New messages are picked up automatically** two ways: the live watcher
+  (instant, but requires the bot to be invited to the channel) or the
+  **scheduled auto-scan** — set `SCAN_INTERVAL_MINUTES=5` and the bot sweeps
+  the channel(s) every N minutes via the user token, no invite needed. It
+  covers the default channel plus every channel in `AUTOFIX_CHANNEL_CONFIG`,
+  and never double-threads (existing replies are detected).
 
 ## Safety
 

@@ -37,28 +37,48 @@ actionable, AI-analyzed threads:
 | **AI analysis** | local `claude` CLI (subscription login, no API key); model via `AUTOFIX_ANALYSIS_MODEL` (default `claude-fable-5`) |
 | **Slack** | Socket Mode (no public URL — runs behind VPN); app created from `slack-autofix-manifest.json` |
 
-## Setup
+## Setup — what YOU provide after cloning
 
 ```bash
 npm install
-cp .env.example .env        # fill in (see below)
+cp .env.example .env        # ← every input below goes in this file
 npm start                   # long-lived bot process
 ```
 
-1. Create the Slack app: api.slack.com/apps → *Create New App → From an app
-   manifest* → paste `slack-autofix-manifest.json` → install to workspace.
-2. `.env`:
-   - `SLACK_BOT_TOKEN` (xoxb-, OAuth & Permissions) + `SLACK_APP_TOKEN`
-     (xapp-, App-Level Token with `connections:write`)
-   - `SLACK_USER_TOKEN` (xoxp-, optional) — lets `scan` read channel history
-     **without inviting the bot** to the channel
-   - `SLACK_AUTOFIX_CHANNEL` — the CI-reports channel
-   - `PORTAL_URL` — where the QA portal runs (default `http://127.0.0.1:8080`)
-   - `AUTOFIX_REPO` / `AUTOFIX_BRANCH` — specs repo the auto-fix heals
-   - `GITHUB_TOKEN` — used to list specs (fallback picker)
-   - `CLAUDE_CLI_PATH` — absolute path to the `claude` binary
-   - `QUALITY_URL` — quality dashboard base; leave `QUALITY_COOKIE` blank to
-     read the session live from Chrome
+**Step 1 — create your Slack app** (one time): api.slack.com/apps → *Create New
+App → From an app manifest* → paste `slack-autofix-manifest.json` → install to
+your workspace. This gives you the two Slack tokens below.
+
+**Step 2 — fill `.env`.** These are ALL the inputs; nothing is hardcoded:
+
+| Input | Example | What it controls |
+|---|---|---|
+| `SLACK_BOT_TOKEN` | `xoxb-…` | the bot identity (from OAuth & Permissions) |
+| `SLACK_APP_TOKEN` | `xapp-…` | Socket Mode connection (App-Level Token, `connections:write`) |
+| `SLACK_USER_TOKEN` *(optional)* | `xoxp-…` | lets `scan` read channel history **without inviting the bot** |
+| `SLACK_AUTOFIX_CHANNEL` | `#your-ci-channel` | **your channel** — where CI reports land and buttons are threaded |
+| `AUTOFIX_REPO` | `your-org/your-specs-repo` | **your specs repo** — where draft PRs are opened |
+| `AUTOFIX_BRANCH` | `master` | base branch for fixes (blank = repo default) |
+| `AUTOFIX_FRAMEWORK` | `cypress` or `playwright` | **your test framework** — drives fix prompts + the verification runner |
+| `AUTOFIX_SPEC_FILTER` *(optional)* | `hotel` | narrows the fallback spec picker to your product's paths |
+| `AUTOFIX_ANALYSIS_MODEL` *(optional)* | `claude-fable-5` | model for the triage analysis |
+| `PORTAL_URL` | `http://127.0.0.1:8080` | where the [AutoHeal portal](https://github.com/renukadevig/Agent-AutoHeal-TestScripts) runs |
+| `GITHUB_TOKEN` | `ghp_…` | read the specs repo tree (fallback picker) |
+| `CLAUDE_CLI_PATH` | `/usr/local/bin/claude` | your locally installed + logged-in Claude Code CLI |
+| `QUALITY_URL` | `https://your-quality-dashboard` | report source; leave `QUALITY_COOKIE` blank to read your Chrome session live (macOS) |
+| `AUTOFIX_CHANNEL_CONFIG` *(optional)* | see below | per-channel repo/branch/framework map |
+
+**Step 3 — run it**: `npm start`, then `node slack-autofix-bot.mjs scan` to
+thread buttons under the latest failing reports in your channel.
+
+### Cypress AND Playwright
+
+Set `AUTOFIX_FRAMEWORK=cypress` or `playwright` (globally, or per channel in
+the map below). It changes: the fix instructions the AI receives (run commands,
+config files, wait conventions) and the **independent verification runner**
+(`npx cypress run --spec …` vs `npx playwright test …`) the portal uses before
+opening a PR. Spec detection covers both naming styles
+(`*.cy.*` / `*.spec.*` / `*.test.*`).
 
 ### Multi-team / multi-channel use
 
@@ -71,7 +91,7 @@ Everything a team changes lives in `.env` — no code edits:
   channels, healing into different repos:
 
   ```
-  AUTOFIX_CHANNEL_CONFIG={"#hotel-cypress-logs":{"repo":"org/hotel-specs","filter":"hotel"},"#flights-cypress-logs":{"repo":"org/flight-specs","filter":"flight"}}
+  AUTOFIX_CHANNEL_CONFIG={"#hotel-cypress-logs":{"repo":"org/hotel-specs","filter":"hotel"},"#web-playwright-logs":{"repo":"org/web-pw-specs","framework":"playwright"}}
   ```
 
 - `scan` accepts a channel too: `node slack-autofix-bot.mjs scan 2 "#flights-cypress-logs"`.

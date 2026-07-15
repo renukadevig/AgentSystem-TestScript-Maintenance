@@ -73,6 +73,7 @@ function cfgForName(channelName) {
         repo: c.repo || REPO,
         branch: c.branch ?? BRANCH,
         filter: c.filter ?? SPEC_FILTER_RAW,
+        framework: (c.framework || process.env.AUTOFIX_FRAMEWORK || 'cypress').toLowerCase() === 'playwright' ? 'playwright' : 'cypress',
     };
 }
 
@@ -159,10 +160,15 @@ function confirmDialog(specLabel, repo) {
 // reportId → [{ spec, errors: [{ title, message }] }]
 const reportCache = new Map();
 
-/** Pull the 24-char report id out of a reporter message's Report link. */
+/** Pull the 24-char report id out of a reporter message's Report link.
+ *  The category segment (cypress/backend/…) is captured so the right
+ *  dashboard API is queried — remembered per report id. */
+const reportCategory = new Map();
 function extractReportId(msg) {
-    const m = JSON.stringify(msg).match(/public\/insights\/cypress\/([a-f0-9]{24})/i);
-    return m ? m[1] : null;
+    const m = JSON.stringify(msg).match(/public\/insights\/(\w[\w-]*)\/([a-f0-9]{24})/i);
+    if (!m) return null;
+    reportCategory.set(m[2], m[1]);
+    return m[2];
 }
 
 /**
@@ -188,7 +194,7 @@ async function fetchFailedSpecs(reportId) {
     if (!QUALITY_URL) throw new Error('QUALITY_URL not set — configure the quality dashboard base URL in .env');
     if (reportCache.has(reportId)) return reportCache.get(reportId);
     const cookie = await qualityCookie();
-    const res = await fetch(`${QUALITY_URL}/api/insights/cypress/${reportId}`, {
+    const res = await fetch(`${QUALITY_URL}/api/insights/${reportCategory.get(reportId) || 'cypress'}/${reportId}`, {
         headers: { cookie, 'user-agent': 'qa-autofix-bot' },
         redirect: 'manual', // a login redirect means the session expired
     });
@@ -971,6 +977,7 @@ async function startHeal(spec, failureContext, cfg) {
             spec,
             openPr: true,
             cliType: 'claude',
+            framework: cfg.framework || 'cypress',
             failureContext: failureContext || '',
         }),
     });

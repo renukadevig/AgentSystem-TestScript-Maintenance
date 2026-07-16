@@ -612,7 +612,28 @@ async function runAndReport({ client, channel, threadTs, user, spec, failureCont
                         `Review it, then mark ready to merge.`,
                 );
             } else if (job.verdict === 'PRODUCT_BUG') {
-                await say(`:beetle: Verdict *PRODUCT_BUG* — real app bug, not the test. No PR opened; raise it with the team.`);
+                // Copy-paste-ready bug report so the finding can go straight
+                // into Jira without digging through the portal logs.
+                const b = job.bugReport;
+                if (b && (b.summary || b.steps?.length)) {
+                    const steps = (b.steps || []).map((s, i) => `${i + 1}. ${s}`).join('\n');
+                    await say(
+                        `:beetle: *Verdict: PRODUCT_BUG* — the app is broken, not the test. No PR opened; the test was left untouched.\n\n` +
+                            `*🐞 Bug report (copy-paste ready):*\n` +
+                            `*Summary:* ${b.summary || '(see below)'}\n` +
+                            (steps ? `*Steps to reproduce:*\n${steps}\n` : '') +
+                            (b.expected ? `*Expected result:* ${b.expected}\n` : '') +
+                            (b.actual ? `*Actual result:* ${b.actual}\n` : '') +
+                            (b.evidence ? `*Evidence:* ${b.evidence}\n` : '') +
+                            `*Spec:* \`${spec}\``,
+                    );
+                } else {
+                    // Older jobs / missing structured fields — fall back to the AI's own summary tail.
+                    await say(
+                        `:beetle: *Verdict: PRODUCT_BUG* — real app bug, not the test. No PR opened.\n` +
+                            `_AI findings:_\n>>> ${(job.healSummary || 'see portal job log').slice(-1200)}`,
+                    );
+                }
             } else if (job.status === 'error') {
                 await say(`:x: Heal failed: ${job.error || 'unknown error'}`);
             } else {

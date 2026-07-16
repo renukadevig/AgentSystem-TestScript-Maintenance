@@ -611,6 +611,14 @@ async function runAndReport({ client, channel, threadTs, user, spec, failureCont
                         `Branch \`${job.pr.branch}\` → \`${job.pr.base}\` · Verdict *${job.verdict}* (${verifyLine}) · ${job.changedFiles.length} file(s) changed.\n` +
                         `Review it, then mark ready to merge.`,
                 );
+            } else if (job.verdict === 'OBSOLETE_TEST') {
+                // Neutral, forward-looking: state the product change + next step.
+                const o = job.obsoleteReport || {};
+                await say(
+                    `:package: *Triage result — spec update needed, no app fix required.*\n` +
+                        (o.reason ? `${o.reason}\n` : `The tested feature appears to have been removed or replaced in the product.\n`) +
+                        `*Recommended action:* ${o.recommendation || `retire or rewrite \`${spec}\` to cover the current product behaviour.`}`,
+                );
             } else if (job.verdict === 'PRODUCT_BUG') {
                 // Copy-paste-ready bug report so the finding can go straight
                 // into Jira without digging through the portal logs.

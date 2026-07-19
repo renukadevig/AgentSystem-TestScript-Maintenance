@@ -1,4 +1,4 @@
-# QA Slack Auto-fix Bot
+# QA Test Maintanence Agentic system
 
 **The sensing + triage half of an agentic QA system.** Every new build that
 hits staging can break E2E scripts without breaking the product — renamed

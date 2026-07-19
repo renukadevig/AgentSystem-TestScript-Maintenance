@@ -36,17 +36,17 @@ import {
     CHANNEL_CONFIG,
     cfgForName,
 } from './lib/config.mjs';
-import { analysisCache, loadAnalysisCache } from './lib/store.mjs';
-import { analyzeReport, heuristicAnalysis, CATEGORY_BADGE } from './lib/ai.mjs';
+import { analysisCache, loadAnalysisCache } from './lib/memory/store.mjs';
+import { analyzeReport, heuristicAnalysis, CATEGORY_BADGE } from './lib/analyze/ai.mjs';
 import {
     extractReportId,
     fetchFailedSpecs,
     failureContextFor,
     listSpecs,
     specOption,
-} from './lib/reports.mjs';
-import { extractJenkinsBuild, analyzeCrash, CRASH_BADGE, crashRcaText, shareCrashRca } from './lib/crash.mjs';
-import { startHeal, pollHeal } from './lib/portal.mjs';
+} from './lib/observe/reports.mjs';
+import { extractJenkinsBuild, analyzeCrash, CRASH_BADGE, crashRcaText, shareCrashRca } from './lib/analyze/crash.mjs';
+import { startHeal, pollHeal } from './lib/act/portal.mjs';
 
 if (!BOT_TOKEN || !APP_TOKEN) {
     console.error(

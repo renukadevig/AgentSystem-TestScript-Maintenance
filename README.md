@@ -39,6 +39,92 @@ actionable, AI-analyzed threads:
  → draft PR link in thread
 ```
 
+## Agentic architecture — where the agent loop lives
+
+This repo is the **sensing + triage half of an agentic system** (the acting
+half is the [AutoHeal portal](https://github.com/renukadevig/CI-FailedTestScripts-AutoFix-Portal)).
+There is no fixed failure→fix mapping anywhere: for each CI report the system
+**observes** the evidence, **reasons** about root cause with an LLM,
+**classifies** each failure, asks a human to approve a target, then runs an
+**act → verify → retry** loop until the spec is green, a real product bug is
+proven, or it honestly reports it could not fix it.
+
+```
+ Goal: keep the CI suite green without hand-maintaining broken specs
+
+ TRIGGER   CI report / Jenkins crash lands in Slack     ┐
+    ▼      (watcher or scheduled auto-scan)             │
+ OBSERVE   fetch report JSON / console logs via the     │  THIS REPO
+    ▼      operator's live Chrome session               │  lib/observe/
+ ANALYZE   local Claude CLI reasons over each failure;  │  lib/analyze/
+    ▼      classifies 🔧 test-code / 🐞 bug / 🌐 env     │
+ PRESENT   triage modal + spec picker in the thread     │  slack-autofix-bot.mjs
+    ▼                                                   │
+ HUMAN     operator picks the spec to fix  (approval    │
+    ▼      gate — nothing is changed without a click)   ┘
+ ACT       POST /api/heal → AutoHeal portal             ┐  lib/act/ →
+    ▼                                                   │
+ ┌──────────────────────────────────────────────┐       │  PORTAL REPO
+ │ AGENT LOOP (max 3 attempts)                  │       │  lib/healPipeline.js
+ │  PLAN   heal / refix prompt from real errors │       │
+ │  ACT    Claude CLI edits the spec            │       │
+ │  OBSERVE independent Cypress/Playwright run  │       │
+ │  DECIDE  green → done │ red → replan & retry │       │
+ │          product bug / obsolete → stop       │       │
+ └──────────────────────────────────────────────┘       ┘
+    ▼
+ FINISH    draft PR + loop verdicts threaded back to Slack
+```
+
+| Agent capability | What happens | Code |
+|---|---|---|
+| **Trigger** | live watcher / scheduled `scan` detects failing reports & crashes | `slack-autofix-bot.mjs` |
+| **Observe** | fetch + parse reports (dashboard JSON, mochawesome, Playwright, AI-extracted HTML), Jenkins console logs | [`lib/observe/reports.mjs`](lib/observe/reports.mjs), [`lib/observe/session.mjs`](lib/observe/session.mjs) |
+| **Analyze / reason** | Claude CLI triages each failed spec; crash RCA from console log | [`lib/analyze/ai.mjs`](lib/analyze/ai.mjs), [`lib/analyze/crash.mjs`](lib/analyze/crash.mjs) |
+| **Classify** | `🔧 test-code fix` / `🐞 product bug` / `🌐 environment` per spec | `lib/analyze/ai.mjs` |
+| **Memory** | per-report analysis cache shared across bot + CLI processes, survives restarts | [`lib/memory/store.mjs`](lib/memory/store.mjs) |
+| **Human approval** | triage modal → explicit spec pick + confirm before any change | `slack-autofix-bot.mjs` |
+| **Act (delegate)** | start + poll self-heal jobs over HTTP | [`lib/act/portal.mjs`](lib/act/portal.mjs) |
+| **Plan → act → verify → retry** | the iterative repair loop (`MAX_HEAL_LOOPS`) with independent verification | portal [`lib/healPipeline.js`](https://github.com/renukadevig/CI-FailedTestScripts-AutoFix-Portal/blob/main/lib/healPipeline.js) |
+
+**Why this is agentic, not scripted automation:**
+
+- **No hardcoded failure rules** — the LLM reasons over the actual error
+  evidence; the same input class can produce different conclusions (fix the
+  test vs raise a bug vs blame the environment).
+- **Adapts to unseen inputs** — report parsing is tiered: native JSON formats
+  first, and for anything unknown (Allure, custom HTML, plain text) the AI
+  reads the content and extracts the failures itself.
+- **Uses tools** — Slack, Chrome session, quality dashboard, Jenkins, GitHub,
+  Cypress/Playwright runners, the Claude CLI.
+- **Verifies its own work and replans** — the portal never trusts the AI's
+  `HEALED` claim; it reruns the spec independently and feeds the *real* output
+  back into the next fix attempt.
+- **Knows when to stop** — `PRODUCT_BUG`, `OBSOLETE_TEST` and `COULD_NOT_FIX`
+  are first-class outcomes; assertions are never weakened to force green.
+- **Human in the loop by design** — analysis is read-only; acting requires an
+  explicit human selection, and output is a draft PR, not a merge.
+
+### Repository layout (mirrors the agent stages)
+
+```
+slack-autofix-bot.mjs   orchestrator: Slack events, buttons, modals, watcher/scan
+slack-autofix-manifest.json  Slack app definition
+quality-cookie.mjs      Chrome-session reader (macOS Keychain)
+lib/
+  config.mjs            env/config, per-channel repo map
+  observe/              OBSERVE — gather evidence
+    reports.mjs           fetch + parse CI reports (all formats, tiered)
+    session.mjs           live Chrome session cookies for gated dashboards
+  analyze/              ANALYZE — reason over evidence (local Claude CLI)
+    ai.mjs                per-spec root-cause triage + classification
+    crash.mjs             Jenkins crash RCA from console logs
+  act/                  ACT — delegate the fix to the AutoHeal portal
+    portal.mjs            start / poll self-heal jobs (POST /api/heal)
+  memory/               MEMORY — persistence across restarts
+    store.mjs             analysis cache + report references
+```
+
 ## Requirements — who can use this
 
 > **Disclaimer:** this bot is useful only if your team already has ALL of the

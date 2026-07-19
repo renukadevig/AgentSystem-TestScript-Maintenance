@@ -42,7 +42,7 @@ actionable, AI-analyzed threads:
 ## Agentic architecture — where the agent loop lives
 
 This repo is the **sensing + triage half of an agentic system** (the acting
-half is the [AutoHeal portal](https://github.com/renukadevig/CI-FailedTestScripts-AutoFix-Portal)).
+half is the [AutoHeal portal](https://github.com/renukadevig/Agent-AutoTest.ai)).
 There is no fixed failure→fix mapping anywhere: for each CI report the system
 **observes** the evidence, **reasons** about root cause with an LLM,
 **classifies** each failure, asks a human to approve a target, then runs an
@@ -85,7 +85,7 @@ proven, or it honestly reports it could not fix it.
 | **Memory** | per-report analysis cache shared across bot + CLI processes, survives restarts | [`lib/memory/store.mjs`](lib/memory/store.mjs) |
 | **Human approval** | triage modal → explicit spec pick + confirm before any change | `slack-autofix-bot.mjs` |
 | **Act (delegate)** | start + poll self-heal jobs over HTTP | [`lib/act/portal.mjs`](lib/act/portal.mjs) |
-| **Plan → act → verify → retry** | the iterative repair loop (`MAX_HEAL_LOOPS`) with independent verification | portal [`lib/healPipeline.js`](https://github.com/renukadevig/CI-FailedTestScripts-AutoFix-Portal/blob/main/lib/healPipeline.js) |
+| **Plan → act → verify → retry** | the iterative repair loop (`MAX_HEAL_LOOPS`) with independent verification | portal [`lib/healPipeline.js`](https://github.com/renukadevig/Agent-AutoTest.ai/blob/main/lib/healPipeline.js) |
 
 **Why this is agentic, not scripted automation:**
 
@@ -139,7 +139,7 @@ lib/
 > 4. **CI/CD that posts test reports into the Slack channel** (scheduled
 >    Jenkins/GitHub Actions/GitLab runs) — see the prerequisite section below
 >    for the exact message format.
-> 5. The **[AutoHeal portal](https://github.com/renukadevig/CI-FailedTestScripts-AutoFix-Portal)**
+> 5. The **[AutoHeal portal](https://github.com/renukadevig/Agent-AutoTest.ai)**
 >    running somewhere reachable — the bot delegates the actual fixing to it.
 >    (Analysis-only use works without it.)
 > 6. **macOS** for the runtime Chrome-session reader; on Linux/Windows set
@@ -153,7 +153,7 @@ lib/
 
 | Dependency | How |
 |---|---|
-| **QA portal** (the fix engine) | plain HTTP — `POST $PORTAL_URL/api/heal`; run the [portal](https://github.com/renukadevig/CI-FailedTestScripts-AutoFix-Portal) separately |
+| **QA portal** (the fix engine) | plain HTTP — `POST $PORTAL_URL/api/heal`; run the [portal](https://github.com/renukadevig/Agent-AutoTest.ai) separately |
 | **Quality dashboard** (report data) | operator's own Chrome session, read at runtime (macOS Keychain) — no pasted cookies |
 | **Jenkins** (console logs) | same runtime Chrome-session mechanism |
 | **AI analysis** | local `claude` CLI (subscription login, no API key); model via `AUTOFIX_ANALYSIS_MODEL` (default `claude-fable-5`) |
@@ -184,7 +184,7 @@ your workspace. This gives you the two Slack tokens below.
 | `AUTOFIX_FRAMEWORK` | `cypress` or `playwright` | **your test framework** — drives fix prompts + the verification runner |
 | `AUTOFIX_SPEC_FILTER` *(optional)* | `hotel` | narrows the fallback spec picker to your product's paths |
 | `AUTOFIX_ANALYSIS_MODEL` *(optional)* | `claude-fable-5` | model for the triage analysis |
-| `PORTAL_URL` | `http://127.0.0.1:8080` | where the [AutoHeal portal](https://github.com/renukadevig/CI-FailedTestScripts-AutoFix-Portal) runs |
+| `PORTAL_URL` | `http://127.0.0.1:8080` | where the [AutoHeal portal](https://github.com/renukadevig/Agent-AutoTest.ai) runs |
 | `GITHUB_TOKEN` | `ghp_…` | read the specs repo tree (fallback picker) |
 | `CLAUDE_CLI_PATH` | `/usr/local/bin/claude` | your locally installed + logged-in Claude Code CLI |
 | `QUALITY_URL` | `https://your-quality-dashboard` | report source; leave `QUALITY_COOKIE` blank to read your Chrome session live (macOS) |

@@ -1,48 +1,20 @@
 # QA Slack Auto-fix Bot
 
-**Stop losing hours to broken test scripts.** When a new build hits staging, it
-often breaks E2E scripts without breaking the product — renamed locators,
-changed API contracts, reordered navigation, flaky waits. The scheduled CI run
-then floods your Slack channel with failures, and someone has to triage and fix
-each one by hand.
-
-This bot puts the whole maintenance loop **one click away, right in the Slack
-thread**: AI analyses the failures from the CI report, tells you which are
-test-code issues vs real product bugs, fixes the script, verifies with a real
-rerun, and opens a draft PR — turning hours of test maintenance into minutes of
+**The sensing + triage half of an agentic QA system.** Every new build that
+hits staging can break E2E scripts without breaking the product — renamed
+locators, changed API contracts, reordered navigation, flaky waits — and the
+scheduled CI run then floods your Slack channel with failures someone has to
+triage and fix by hand. This system turns that whole maintenance loop into
+**one click in the Slack thread**: AI analyses the failures, tells you which
+are test-code issues vs real product bugs, fixes the script, verifies with a
+real rerun, and opens a draft PR — hours of test maintenance become minutes of
 review.
-
-A Socket-Mode Slack bot for QA channels that turns CI failure noise into
-actionable, AI-analyzed threads:
-
-- **Failing Cypress reports** → threads a **🧠 AI Analyse Failures** button →
-  modal with per-spec **root-cause triage** (`🔧 test-code fix` / `🐞 possible
-  product bug` / `🌐 environment`) → pick a spec → **auto-fix** it via the QA
-  portal (AI repair → independent Cypress verification → draft PR), with live
-  progress threaded back.
-- **Crashed Jenkins builds** (no report exists) → threads a **🧠 AI Analyse
-  Crash** button → fetches the build's **console log**, AI infers what the run
-  was executing when it died and why → **posts the RCA into the thread** for
-  the team — including a direct answer if the crash message asked a question
-  (e.g. *"do we need to split the job?"*).
-
-```
- CI reporter message           Jenkins Crash Monitor message
- (Total/Passed/Failed)         (job + build + timeout)
-        │ scan / watcher              │ scan / watcher
-        ▼                             ▼
- [🧠 AI Analyse Failures]      [🧠 AI Analyse Crash]
-        │ click                       │ click
-        ▼                             ▼
- modal: per-spec root causes   RCA from console log
- → pick spec → auto-fix        → posted in-thread (team-visible)
- → draft PR link in thread
-```
 
 ## Agentic architecture — where the agent loop lives
 
-This repo is the **sensing + triage half of an agentic system** (the acting
-half is the [AutoHeal portal](https://github.com/renukadevig/Agent-AutoTest.ai)).
+This Socket-Mode Slack bot is the part that **senses and triages**; the acting
+half — the iterative fix loop — is the
+[AutoHeal portal](https://github.com/renukadevig/Agent-AutoTest.ai).
 There is no fixed failure→fix mapping anywhere: for each CI report the system
 **observes** the evidence, **reasons** about root cause with an LLM,
 **classifies** each failure, asks a human to approve a target, then runs an
@@ -75,6 +47,20 @@ proven, or it honestly reports it could not fix it.
     ▼
  FINISH    draft PR + loop verdicts threaded back to Slack
 ```
+
+Two entry points, both one click in the thread:
+
+- **Failing Cypress reports** → threads a **🧠 AI Analyse Failures** button →
+  modal with per-spec **root-cause triage** (`🔧 test-code fix` / `🐞 possible
+  product bug` / `🌐 environment`) → pick a spec → **auto-fix** it via the
+  portal (AI repair → independent Cypress verification → draft PR), with live
+  progress threaded back.
+- **Crashed Jenkins builds** (no report exists) → threads a **🧠 AI Analyse
+  Crash** button → fetches the build's **console log**, AI infers what the run
+  was executing when it died and why → **posts the RCA into the thread** for
+  the team — including a direct answer if the crash message asked a question
+  (e.g. *"do we need to split the job?"*). This path is analysis-only — no
+  spec to fix — so it ends at the ANALYZE stage above.
 
 | Agent capability | What happens | Code |
 |---|---|---|

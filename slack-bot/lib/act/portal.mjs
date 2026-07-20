@@ -27,3 +27,16 @@ export async function pollHeal(jobId) {
     if (!res.ok) throw new Error(`poll failed: ${res.status}`);
     return res.json();
 }
+
+/**
+ * Apply a FEATURE_CHANGED test update and open a draft PR — called only after a
+ * human clicks "Agree to apply for feature change" in Slack. The portal already
+ * has the AI's adapted diff in the job's working tree; this commits it to a new
+ * branch and opens the PR.
+ */
+export async function applyFeatureChange(jobId) {
+    const res = await fetch(`${PORTAL}/api/heal/${jobId}/apply-feature-change`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `portal responded ${res.status}`);
+    return data;
+}

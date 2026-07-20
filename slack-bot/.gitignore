@@ -1,0 +1,7 @@
+node_modules
+.env
+.env.local
+.analysis-cache.json
+*.log
+nohup.out
+.DS_Store

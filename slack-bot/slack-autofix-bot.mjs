@@ -46,7 +46,7 @@ import {
     specOption,
 } from './lib/observe/reports.mjs';
 import { extractJenkinsBuild, analyzeCrash, CRASH_BADGE, crashRcaText, shareCrashRca } from './lib/analyze/crash.mjs';
-import { startHeal, pollHeal } from './lib/act/portal.mjs';
+import { startHeal, pollHeal, applyFeatureChange } from './lib/act/portal.mjs';
 
 if (!BOT_TOKEN || !APP_TOKEN) {
     console.error(
@@ -585,6 +585,7 @@ async function runAndReport({ client, channel, threadTs, user, spec, failureCont
     }
 
     let lastLoops = 0;
+    let postedReverify = false;
     const started = Date.now();
     const TIMEOUT_MS = 45 * 60 * 1000;
     while (Date.now() - started < TIMEOUT_MS) {
@@ -594,6 +595,14 @@ async function runAndReport({ client, channel, threadTs, user, spec, failureCont
             job = await pollHeal(jobId);
         } catch {
             continue; // transient poll failure
+        }
+        // A suspected product bug is being reverified — surface the step live so
+        // the team knows a Cypress rerun is confirming it before we escalate.
+        if (job.reverifyingBug && !postedReverify) {
+            postedReverify = true;
+            await say(
+                `:mag: It seems like a *product bug* — running the Cypress runner once to reverify and I'll share the finding with you…`,
+            );
         }
         if ((job.healLoops?.length || 0) > lastLoops) {
             lastLoops = job.healLoops.length;
@@ -619,6 +628,58 @@ async function runAndReport({ client, channel, threadTs, user, spec, failureCont
                         (o.reason ? `${o.reason}\n` : `The tested feature appears to have been removed or replaced in the product.\n`) +
                         `*Recommended action:* ${o.recommendation || `retire or rewrite \`${spec}\` to cover the current product behaviour.`}`,
                 );
+            } else if (job.verdict === 'FEATURE_CHANGED') {
+                // Reverify reclassified the suspected bug as a RECENT FEATURE
+                // CHANGE — the test was out of date, not the app. The portal
+                // holds the AI's adapted diff; offer a one-click "agree & apply"
+                // that opens the PR (nothing ships without this human OK).
+                const fc = job.featureChange || {};
+                const rv = job.bugReverify || null;
+                const files = (job.changedFiles || []).map((f) => `\`${f}\``).join(', ');
+                await client.chat.postMessage({
+                    channel,
+                    thread_ts: threadTs,
+                    text: 'Not a product bug — a recent feature change. Review and apply.',
+                    blocks: [
+                        {
+                            type: 'section',
+                            text: {
+                                type: 'mrkdwn',
+                                text:
+                                    `:arrows_counterclockwise: *Reverify finding: not a product bug — a recent feature change.*\n` +
+                                    `I reran \`${spec}\` once to reverify. The feature still works but changed recently, so the *test was out of date* — this is not an app bug.\n\n` +
+                                    (fc.summary ? `*What changed:* ${fc.summary}\n` : '') +
+                                    (fc.reason ? `*Why it's not a bug:* ${fc.reason}\n` : '') +
+                                    (rv
+                                        ? `*Reverify run:* ${rv.loadError ? `could not reach the app (${rv.loadError})` : `${rv.totalPassed} passed, ${rv.totalFailed} failed`}\n`
+                                        : '') +
+                                    (files ? `*Proposed test update:* ${files}\n` : '') +
+                                    `\nReview the diff in the portal, then agree to apply it and open a draft PR.`,
+                            },
+                        },
+                        {
+                            type: 'actions',
+                            elements: [
+                                {
+                                    type: 'button',
+                                    style: 'primary',
+                                    text: { type: 'plain_text', text: '✅ Agree to apply for feature change' },
+                                    action_id: 'apply_feature_change',
+                                    value: JSON.stringify({ jobId, spec }).slice(0, 1990),
+                                    confirm: {
+                                        title: { type: 'plain_text', text: 'Apply the test update?' },
+                                        text: {
+                                            type: 'mrkdwn',
+                                            text: `Commits the adapted \`${spec}\` to a new branch and opens a *draft PR* for review.`,
+                                        },
+                                        confirm: { type: 'plain_text', text: 'Apply & open PR' },
+                                        deny: { type: 'plain_text', text: 'Cancel' },
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                });
             } else if (job.verdict === 'PRODUCT_BUG') {
                 // Copy-paste-ready bug report so the finding can go straight
                 // into Jira without digging through the portal logs.
@@ -733,6 +794,109 @@ app.action('autofix_run', async ({ ack, body, client, action }) => {
         user: body.user.id,
         spec,
     });
+});
+
+// ---- "Agree to apply for feature change" → apply diff + open PR ----------------
+app.action('apply_feature_change', async ({ ack, body, client, action }) => {
+    await ack();
+    let jobId = '';
+    let spec = '';
+    try {
+        const v = JSON.parse(action.value || '{}');
+        jobId = v.jobId || '';
+        spec = v.spec || '';
+    } catch {
+        /* malformed value */
+    }
+    if (!jobId) return;
+
+    const channel = body.channel.id;
+    const ts = body.message.ts;
+    const threadTs = body.message.thread_ts || body.message.ts;
+    const intro = body.message.blocks?.[0]?.text?.text || '';
+    const setMsg = (blocks, fallback) =>
+        client.chat.update({ channel, ts, text: fallback, blocks }).catch(() => {});
+
+    // Swap the button for a loading notice so it can't be double-clicked while
+    // the commit + PR is in flight.
+    await setMsg(
+        [
+            { type: 'section', text: { type: 'mrkdwn', text: intro } },
+            {
+                type: 'context',
+                elements: [
+                    {
+                        type: 'mrkdwn',
+                        text: `⏳ *Applying the feature-change update…* approved by <@${body.user.id}>. Committing and opening a draft PR…`,
+                    },
+                ],
+            },
+        ],
+        'Applying feature-change update…',
+    );
+
+    try {
+        const job = await applyFeatureChange(jobId);
+        if (!job.pr?.url) throw new Error(job.prError || 'no PR was opened');
+        await setMsg(
+            [
+                { type: 'section', text: { type: 'mrkdwn', text: intro } },
+                {
+                    type: 'context',
+                    elements: [
+                        {
+                            type: 'mrkdwn',
+                            text: `:white_check_mark: Applied by <@${body.user.id}> — draft PR opened.`,
+                        },
+                    ],
+                },
+            ],
+            'Feature-change update applied',
+        );
+        await client.chat.postMessage({
+            channel,
+            thread_ts: threadTs,
+            text: `Feature-change PR opened: ${job.pr.url}`,
+            unfurl_links: false,
+            blocks: [
+                {
+                    type: 'section',
+                    text: {
+                        type: 'mrkdwn',
+                        text:
+                            `:white_check_mark: *${job.pr.draft ? 'Draft PR' : 'PR'} opened for the feature-change update:* ${job.pr.url}\n` +
+                            `Branch \`${job.pr.branch}\` → \`${job.pr.base}\` · ${job.changedFiles?.length || 0} file(s) changed.\n` +
+                            `Review it, then mark ready to merge.`,
+                    },
+                },
+            ],
+        });
+    } catch (e) {
+        // Put the button back so it can be retried.
+        await setMsg(
+            [
+                { type: 'section', text: { type: 'mrkdwn', text: intro } },
+                {
+                    type: 'actions',
+                    elements: [
+                        {
+                            type: 'button',
+                            style: 'primary',
+                            text: { type: 'plain_text', text: '✅ Agree to apply for feature change' },
+                            action_id: 'apply_feature_change',
+                            value: action.value,
+                        },
+                    ],
+                },
+            ],
+            'Feature-change update failed',
+        );
+        await client.chat.postMessage({
+            channel,
+            thread_ts: threadTs,
+            text: `:x: Could not apply the feature change for \`${spec}\`: ${e.message}`,
+        });
+    }
 });
 
 function failedTestCard({ spec, testName }) {

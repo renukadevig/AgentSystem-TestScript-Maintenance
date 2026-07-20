@@ -1,0 +1,12 @@
+# Never ship local install output, build cache, secrets, or runtime clones.
+node_modules
+.next
+out
+.git
+.env
+.env.local
+.workspaces
+*.log
+.DS_Store
+Dockerfile
+.dockerignore

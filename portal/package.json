@@ -1,0 +1,29 @@
+{
+  "name": "qa-portal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Internal QA Portal — clone a repo, scan & run Cypress specs, VLM-diff screenshots, auto-file bug tickets.",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 8080",
+    "guard": "node guard.js",
+    "build": "next build",
+    "start": "next start -p 8080",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@slack/bolt": "^4.7.3",
+    "cypress": "^13.15.0",
+    "next": "^15.1.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9",
+    "eslint-config-next": "^15.1.6"
+  },
+  "engines": {
+    "node": ">=18.18"
+  }
+}

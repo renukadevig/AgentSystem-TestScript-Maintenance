@@ -1,0 +1,25 @@
+# Run the portal as a long-lived container.
+#
+#   1. Put your secrets in .env.local (copy from .env.example) — it is gitignored.
+#   2. docker compose up -d --build
+#   3. Open http://<host>:8080
+#
+# For an INTERNAL tool that holds private GitHub/Jira/OpenRouter tokens, bind it
+# to your VPN/internal network — do NOT expose port 8080 to the public internet
+# (the app has no login). Put it behind your reverse proxy / VPN.
+services:
+  portal:
+    build: .
+    # Secrets are read from .env.local at runtime, never baked into the image.
+    env_file:
+      - .env.local
+    ports:
+      # host:container — change the host side if 8080 is taken on the VM.
+      - "8080:8080"
+    volumes:
+      # Persist cloned repos + screenshots outside the container layer.
+      - workspaces:/app/.workspaces
+    restart: unless-stopped
+
+volumes:
+  workspaces:

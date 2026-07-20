@@ -1,0 +1,12 @@
+node_modules
+.next
+out
+.env
+.env.local
+# Cloned repos + screenshot artifacts produced at runtime
+.workspaces
+*.log
+.DS_Store
+# AI triage cache (contains internal report data)
+scripts/.analysis-cache.json
+nohup.out

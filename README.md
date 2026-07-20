@@ -1,4 +1,4 @@
-# QA Auto-fix — Agentic Test Maintenance
+# AutoTest.ai — Agentic QA Auto-fix
 
 One repo, two cooperating processes that together form an agentic QA auto-fix
 system. They are **separate apps that talk over HTTP** — not one program — so

@@ -1,4 +1,4 @@
-# CI-FailedTestScripts-AutoFix-Portal
+# AutoTest.ai — Fix Engine (portal)
 
 **AI engine that heals broken CI test scripts: analyse → fix → run & verify → draft PR.**
 

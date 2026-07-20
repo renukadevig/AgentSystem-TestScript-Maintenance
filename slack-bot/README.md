@@ -1,4 +1,4 @@
-# QA Test Maintanence Agentic system
+# AutoTest.ai — Slack Triage Bot (slack-bot)
 
 **The sensing + triage half of an agentic QA system.** Every new build that
 hits staging can break E2E scripts without breaking the product — renamed
